@@ -5,24 +5,42 @@ permissions:
   contents: read
 concurrency:
   group: shinagawa-probe
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 6
+    timeout-minutes: 4
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: ブラウザ準備
-        run: |
-          python -m pip install 'playwright==1.56.0'
-          python -m playwright install --with-deps chromium
-      - name: 公開検索結果の診断（荏原地区のみ・予約なし）
+      - name: ブラウザ準備（既存Chrome優先）
+        timeout-minutes: 2
         shell: bash
         run: |
-          python - <<'PY'
+          python -m pip install --disable-pip-version-check 'playwright==1.56.0'
+          CHROME=""
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              CHROME="$(command -v "$candidate")"
+              break
+            fi
+          done
+          if [ -n "$CHROME" ]; then
+            "$CHROME" --version
+            echo "SHINAGAWA_CHROME=$CHROME" >> "$GITHUB_ENV"
+            echo "Using preinstalled browser"
+          else
+            echo "No system browser; installing headless shell only"
+            python -m playwright install --only-shell chromium
+          fi
+      - name: 公開検索結果の診断（荏原地区のみ・予約なし）
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          timeout --signal=TERM --kill-after=5s 100s python -u - <<'PY'
           import json
+          import os
           from pathlib import Path
           from urllib.parse import urlsplit
           from playwright.sync_api import sync_playwright
@@ -62,19 +80,24 @@ jobs:
               except Exception as e:
                   print('SCREENSHOT_ERROR',type(e).__name__,flush=True)
           with sync_playwright() as p:
-              browser = p.chromium.launch()
+              chrome = os.environ.get('SHINAGAWA_CHROME')
+              print('BROWSER_START', 'system' if chrome else 'headless-shell', flush=True)
+              browser = p.chromium.launch(**({'executable_path': chrome} if chrome else {}), timeout=15000)
               page = browser.new_page(locale='ja-JP',timezone_id='Asia/Tokyo',viewport={'width':1440,'height':1000})
               responses=[]
               def observe(r):
                   if r.request.resource_type in ('document','xhr','fetch') and urlsplit(r.url).hostname == urlsplit(URL).hostname and len(responses)<80:
                       responses.append({'method':r.request.method,'path':urlsplit(r.url).path,'status':r.status})
               page.on('response',observe)
+              page.set_default_timeout(8000)
               try:
-                  response=page.goto(URL,wait_until='domcontentloaded',timeout=30000)
+                  print('HOME_REQUEST',flush=True)
+                  response=page.goto(URL,wait_until='domcontentloaded',timeout=20000)
+                  print('HOME_HTTP',response.status if response else None,flush=True)
                   if response is None or response.status>=400:
                       raise RuntimeError('home HTTP failure')
                   def ready():
-                      page.locator('#loadmsg').wait_for(state='hidden',timeout=30000)
+                      page.locator('#loadmsg').wait_for(state='hidden',timeout=10000)
 
                   def checked_by_label(control):
                       target = page.locator('#'+control)
@@ -92,13 +115,17 @@ jobs:
                   page.locator('#bname').wait_for(state='visible',timeout=15000)
                   ready()
                   # Use the actual public form and its detailed date options.
+                  print('SELECT_MONTH',flush=True)
                   checked_by_label('thismonth')
                   print('MONTH_SELECTED',flush=True)
+                  print('SELECT_DISTRICT',flush=True)
                   page.locator('#bname').select_option(value='1100_0',timeout=15000)
                   ready()
+                  print('SELECT_PURPOSE',flush=True)
                   page.locator('#purpose').select_option(value='31000000_31010300',timeout=15000)
                   ready()
                   print('DISTRICT_AND_PURPOSE_SELECTED',flush=True)
+                  print('SELECT_WEEKENDS',flush=True)
                   if not page.locator('#saturday').is_visible():
                       page.locator('#collapse-when').click(timeout=10000)
                       ready()
@@ -129,7 +156,8 @@ jobs:
                   snapshot(page,'before-search')
                   # Only the verified visible public search button is clicked. No login or booking.
                   ready()
-                  page.locator('#btn-go').click(timeout=15000)
+                  print('SUBMIT_PUBLIC_SEARCH',flush=True)
+                  page.locator('#btn-go').click(timeout=10000)
                   try:
                       page.wait_for_load_state('networkidle',timeout=12000)
                   except Exception:
@@ -138,6 +166,8 @@ jobs:
                   page.wait_for_timeout(1000)
                   snapshot(page,'after-search')
                   print('PUBLIC_SEARCH_CLICKED',flush=True)
+                  if not any(r['method']=='POST' and r['status']<400 for r in responses) and not any(r['path'] != '/shinagawa/web/index.jsp' and r['status']<400 for r in responses):
+                      print('WARNING: search response not independently confirmed',flush=True)
               except Exception as e:
                   print('PROBE_ERROR',type(e).__name__,flush=True)
                   snapshot(page,'error')
@@ -148,6 +178,7 @@ jobs:
           PY
       - name: 診断結果を保存（失敗時も実行）
         if: always()
+        timeout-minutes: 1
         uses: actions/upload-artifact@v4
         with:
           name: shinagawa-public-diagnostics
