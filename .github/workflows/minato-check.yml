@@ -1,4 +1,4 @@
-name: 港区4地区の空き確認
+name: 港区全5地区の空き確認
 on:
   workflow_dispatch:
     inputs:
@@ -6,8 +6,12 @@ on:
         description: LINE接続テストのみ（空き確認なし）
         type: boolean
         default: false
+      dry_run:
+        description: 検索とテストのみ（LINE通知・履歴更新なし）
+        type: boolean
+        default: false
   schedule:
-   - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
+    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
 permissions:
   contents: write
 concurrency:
@@ -17,127 +21,56 @@ jobs:
   check:
     if: github.event_name == 'workflow_dispatch' || vars.MINATO_AUTO_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref }}
       - name: ZIP展開と整合性確認
-        if: inputs.test_line != true
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/minato-source"
           unzip -q minato-facility-check-actions.zip -d "$RUNNER_TEMP/minato-source"
           cd "$RUNNER_TEMP/minato-source"
           python3 - <<'PYCODE'
-          import hashlib
+          import hashlib, json
           from pathlib import Path
-          expected = {'original/search_v4.py':'22d86b3829fc9b1000312301eb6f05418ef404616857d7f78828d06ce57c908f','run_diagnostics.py':'135673fc451905a4414b814e4308f91aa989c1f290251467783501a628a5729b'}
-          for name, digest in expected.items():
-              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+          manifest = Path('manifest.json')
+          if hashlib.sha256(manifest.read_bytes()).hexdigest() != 'e6ea3a3ffa7bf6b27bd62ba1e020f7594a6cc1ffbcf83db2ec49e72fe3af908f':
+              raise SystemExit('MANIFEST_HASH_MISMATCH')
+          for name, info in json.loads(manifest.read_text())['files'].items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != info['sha256']:
                   raise SystemExit('SOURCE_HASH_MISMATCH: '+name)
           PYCODE
+      - name: オフラインテスト
+        if: inputs.dry_run == true
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/minato-source"
+          python3 tests/test_all_districts.py
+          python3 tests/test_notifications.py
       - name: 施設の空き確認
-        if: inputs.test_line != true
+        if: inputs.test_line != true || inputs.dry_run == true
         shell: bash
         run: |
           cd "$RUNNER_TEMP/minato-source"
           rc=0
-          python3 run_diagnostics.py --deadline 150 --output "$RUNNER_TEMP/minato-run" > "$RUNNER_TEMP/minato-result.json" || rc=$?
-          python3 summarize.py "$RUNNER_TEMP/minato-result.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 run_all_districts.py --deadline 300 --output "$RUNNER_TEMP/minato-run" > "$RUNNER_TEMP/minato-result.json" || rc=$?
+          python3 summarize_v5.py "$RUNNER_TEMP/minato-result.json" | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -ne 0 ]; then
             echo "::warning::検索が一部または全部失敗しました。確認済みの枠のみ通知判定します。"
+            if [ "${{ inputs.dry_run == true }}" = 'true' ]; then exit "$rc"; fi
           fi
       - name: LINE通知（新しい空きのみ）
+        if: inputs.dry_run != true && github.ref == 'refs/heads/main'
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           TEST_LINE: ${{ inputs.test_line == true }}
         shell: bash
-        run: |
-          python3 - <<'PYCODE'
-          import hashlib
-          import json
-          import os
-          import sys
-          from pathlib import Path
-          from urllib.request import Request, urlopen
-          from urllib.error import HTTPError, URLError
-
-          DISTRICTS = ('赤坂','高輪','麻布','芝')
-          FIELDS = ('地区','施設・区分','日付','開始','終了')
-
-          def key(row):
-              fields = [row[k] for k in FIELDS]
-              if not all(isinstance(v,str) and v.strip() for v in fields):
-                  raise ValueError('invalid slot')
-              return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()
-
-          def changes(data, old):
-              current = dict(old)
-              new = []
-              for d in DISTRICTS:
-                  status = data.get('地区別', {}).get(d, {}).get('状態')
-                  if status not in ('空きあり','空きなし'):
-                      continue
-                  rows = {key(r):r for r in data.get('空き枠',[]) if r.get('地区') == d}
-                  if bool(rows) != (status == '空きあり'):
-                      raise ValueError('district status mismatch')
-                  new.extend(r for k,r in rows.items() if k not in set(old.get(d,[])))
-                  current[d] = sorted(rows)
-              return new,current
-
-          def message(rows):
-              lines = [f'🏐 新規空き：{len(rows)}件']
-              link = '\n\n予約サイト：https://web101.rsv.ws-scs.jp/web/'
-              run_url = os.environ.get('GITHUB_SERVER_URL','https://github.com') + '/' + os.environ.get('GITHUB_REPOSITORY','') + '/actions/runs/' + os.environ.get('GITHUB_RUN_ID','')
-              for r in sorted(rows,key=lambda r:(r['日付'],r['開始'],r['地区'])):
-                  line = f"{r['地区']}｜{r['施設・区分']}\n{r['日付']}（{r.get('曜日','')}） {r['開始']}～{r['終了']}"
-                  if len(('\n\n'.join(lines+[line])+link+run_url).encode('utf-16-le'))//2 > 4200:
-                      lines.append('残りの枠は実行結果をご確認ください。\n'+run_url)
-                      break
-                  lines.append(line)
-              return '\n\n'.join(lines)+link
-
-          def push(text):
-              token, recipient = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'),os.environ.get('LINE_USER_ID')
-              if not token or not recipient:
-                  raise RuntimeError('LINE secrets not configured')
-              payload = json.dumps({'to':recipient,'messages':[{'type':'text','text':text}]},ensure_ascii=False).encode()
-              req = Request('https://api.line.me/v2/bot/message/push',data=payload,headers={'Content-Type':'application/json','Authorization':'Bearer '+token},method='POST')
-              try:
-                  with urlopen(req,timeout=20) as response:
-                      if response.status != 200:
-                          raise RuntimeError('LINE push failed')
-              except HTTPError as e:
-                  raise RuntimeError(f'LINE HTTP {e.code}') from None
-              except URLError:
-                  raise RuntimeError('LINE connection failed') from None
-
-          def main():
-              if os.environ.get('TEST_LINE') == 'true':
-                  push('🏐 港区施設の空き通知：接続テスト成功')
-                  print('LINE test sent')
-                  return
-              data = json.loads(Path(os.environ['RUNNER_TEMP'],'minato-result.json').read_text())
-              state = Path('.minato-notified.json')
-              old = json.loads(state.read_text()) if state.exists() else {}
-              new,current = changes(data,old)
-              if new:
-                  push(message(new))
-              if current != old:
-                  state.write_text(json.dumps(current,ensure_ascii=False,indent=2,sort_keys=True)+'\n')
-              print(f'New slots: {len(new)}')
-
-          if __name__ == '__main__':
-              try:
-                  main()
-              except Exception as e:
-                  print(str(e) if isinstance(e,RuntimeError) else type(e).__name__,file=sys.stderr)
-                  sys.exit(1)
-          PYCODE
+        run: python3 "$RUNNER_TEMP/minato-source/notify_v5.py"
       - name: 通知済みの枠を保存
-        if: inputs.test_line != true
+        if: inputs.test_line != true && inputs.dry_run != true && github.ref == 'refs/heads/main'
         shell: bash
         run: |
           if [ -f .minato-notified.json ]; then
