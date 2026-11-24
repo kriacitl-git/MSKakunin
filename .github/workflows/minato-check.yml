@@ -1,1 +1,19 @@
 
+name: 港区4地区の空き確認
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: ZIP展開
+        run: unzip -q minato-facility-check-actions.zip -d check
+      - name: 施設の空き確認
+        working-directory: check
+        run: |
+          python3 run_diagnostics.py --deadline 150 > result.json
+          python3 summarize.py result.json | tee -a "$GITHUB_STEP_SUMMARY"
