@@ -1,0 +1,57 @@
+name: 品川区施設検索・初回診断
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: shinagawa-probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: ブラウザ準備
+        run: |
+          python -m pip install 'playwright==1.56.0'
+          python -m playwright install --with-deps chromium
+      - name: 公開検索画面を調査（ログイン・予約なし）
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from playwright.sync_api import sync_playwright
+          URL = 'https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page(locale='ja-JP', timezone_id='Asia/Tokyo')
+              response = page.goto(URL, wait_until='domcontentloaded', timeout=30000)
+              page.get_by_text('空き状況検索', exact=False).first.wait_for(timeout=15000)
+              if response is None or response.status >= 400:
+                  raise RuntimeError('公開ページ取得失敗')
+              data = page.evaluate('''() => {
+                const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+                const clean = s => (s || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+                return {
+                  title: document.title,
+                  selects: [...document.querySelectorAll('select')].filter(visible).map(e => ({id:e.id,name:e.name,labels:[...e.labels||[]].map(l=>clean(l.textContent)),options:[...e.options].map(o=>({label:clean(o.textContent),value:o.value,selected:o.selected}))})),
+                  inputs: [...document.querySelectorAll('input')].filter(e=>visible(e)&&['checkbox','radio','date','text','button','submit'].includes(e.type)).map(e=>({id:e.id,name:e.name,type:e.type,labels:[...e.labels||[]].map(l=>clean(l.textContent)),checked:e.checked,placeholder:e.placeholder})),
+                  buttons: [...document.querySelectorAll('button,a,[role=button]')].filter(visible).map(e=>({id:e.id,text:clean(e.innerText),role:e.getAttribute('role')})).filter(e=>e.text && /検索|施設|目的|選択|条件|期間/.test(e.text)).slice(0,80),
+                  scripts:[...document.scripts].filter(s=>s.src).map(s=>new URL(s.src).pathname)
+                };
+              }''')
+              print('SHINAGAWA_FORM_BEGIN')
+              print(json.dumps(data, ensure_ascii=False, indent=2))
+              print('SHINAGAWA_FORM_END')
+              page.screenshot(path='shinagawa-home.png', full_page=True)
+              browser.close()
+          PY
+      - name: 公開画面の画像を保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: shinagawa-public-home
+          path: shinagawa-home.png
+          retention-days: 2
