@@ -29,8 +29,7 @@ jobs:
               browser = p.chromium.launch()
               page = browser.new_page(locale='ja-JP', timezone_id='Asia/Tokyo')
               response = page.goto(URL, wait_until='domcontentloaded', timeout=30000)
-              page.get_by_text('空き状況検索', exact=False).first.wait_for(timeout=15000)
-              if response is None or response.status >= 400:
+              page.get_by_text('空き状況検索', exact=False).first.wait_for(state='attached', timeout=15000)
                   raise RuntimeError('公開ページ取得失敗')
               data = page.evaluate('''() => {
                 const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
