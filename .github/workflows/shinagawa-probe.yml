@@ -55,7 +55,7 @@ jobs:
               for f in report:
                   compact.append({**{k:v for k,v in f.items() if k not in ('selects','tables')},'selects':[{k:v for k,v in s.items() if k!='options'} for s in f.get('selects',[])],'tables':[{**t,'rows':t['rows'][:4]} for t in f.get('tables',[])]})
               print('SHINAGAWA_RESULT_BEGIN',label,flush=True)
-              print(json.dumps(compact,ensure_ascii=False)[:38000],flush=True)
+              print(json.dumps(compact,ensure_ascii=False),flush=True)
               print('SHINAGAWA_RESULT_END',label,flush=True)
               try:
                   page.screenshot(path=str(out/(label+'.png')),full_page=True,timeout=10000)
@@ -73,20 +73,69 @@ jobs:
                   response=page.goto(URL,wait_until='domcontentloaded',timeout=30000)
                   if response is None or response.status>=400:
                       raise RuntimeError('home HTTP failure')
+                  def ready():
+                      page.locator('#loadmsg').wait_for(state='hidden',timeout=30000)
+
+                  def checked_by_label(control):
+                      target = page.locator('#'+control)
+                      if not target.is_checked():
+                          ready()
+                          label = page.locator('label[for="'+control+'"]')
+                          if label.count() == 1 and label.is_visible():
+                              label.click(timeout=10000)
+                          else:
+                              target.click(timeout=10000)
+                          ready()
+                      if not target.is_checked():
+                          raise RuntimeError('selection not applied: '+control)
+
                   page.locator('#bname').wait_for(state='visible',timeout=15000)
-                  page.locator('#bname').select_option(value='1100_0',timeout=10000)
-                  page.locator('#purpose').select_option(value='31000000_31010300',timeout=10000)
-                  page.locator('#thismonth').check(timeout=10000)
-                  if page.locator('#bname').input_value()!='1100_0' or page.locator('#purpose').input_value()!='31000000_31010300' or not page.locator('#thismonth').is_checked():
+                  ready()
+                  # Use the actual public form and its detailed date options.
+                  checked_by_label('thismonth')
+                  print('MONTH_SELECTED',flush=True)
+                  page.locator('#bname').select_option(value='1100_0',timeout=15000)
+                  ready()
+                  page.locator('#purpose').select_option(value='31000000_31010300',timeout=15000)
+                  ready()
+                  print('DISTRICT_AND_PURPOSE_SELECTED',flush=True)
+                  if not page.locator('#saturday').is_visible():
+                      page.locator('#collapse-when').click(timeout=10000)
+                      ready()
+                  page.locator('#saturday').wait_for(state='attached',timeout=10000)
+                  # Detailed options may change the period mode. Verify the actual
+                  # period and weekday controls before any public search submission.
+                  if page.locator('#days').is_visible():
+                      page.locator('#days').select_option(value='31',timeout=10000)
+                      ready()
+                  for day in ('monday','tuesday','wednesday','thursday','friday','holiday'):
+                      target = page.locator('#'+day)
+                      if target.is_checked():
+                          label = page.locator('label[for="'+day+'"]')
+                          ready()
+                          if label.count() == 1 and label.is_visible():
+                              label.click(timeout=10000)
+                          else:
+                              target.click(timeout=10000)
+                          ready()
+                  for day in ('saturday','sunday'):
+                      checked_by_label(day)
+                  days = page.locator('#days')
+                  period_ok = days.input_value() == '31' if days.is_visible() else page.locator('#thismonth').is_checked()
+                  chosen = [day for day in ('monday','tuesday','wednesday','thursday','friday','saturday','sunday','holiday') if page.locator('#'+day).is_checked()]
+                  print('SELECTED_CONDITIONS',json.dumps({'period_days':days.input_value(),'month_radio':page.locator('#thismonth').is_checked(),'weekdays':chosen,'district':page.locator('#bname').input_value(),'purpose':page.locator('#purpose').input_value()},ensure_ascii=False),flush=True)
+                  if not period_ok or chosen != ['saturday','sunday'] or page.locator('#bname').input_value()!='1100_0' or page.locator('#purpose').input_value()!='31000000_31010300':
                       raise RuntimeError('search selection mismatch')
                   snapshot(page,'before-search')
                   # Only the verified visible public search button is clicked. No login or booking.
-                  page.locator('#btn-go').click(timeout=10000)
+                  ready()
+                  page.locator('#btn-go').click(timeout=15000)
                   try:
                       page.wait_for_load_state('networkidle',timeout=12000)
                   except Exception:
                       pass
-                  page.wait_for_timeout(1500)
+                  ready()
+                  page.wait_for_timeout(1000)
                   snapshot(page,'after-search')
                   print('PUBLIC_SEARCH_CLICKED',flush=True)
               except Exception as e:
