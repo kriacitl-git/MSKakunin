@@ -1,4 +1,4 @@
-name: 品川区・学校月間カレンダー（手動検証）
+name: 品川区・学校月間カレンダー
 'on':
   workflow_dispatch:
     inputs:
@@ -13,6 +13,9 @@ name: 品川区・学校月間カレンダー（手動検証）
         - 大崎
         - 品川
         - 八潮
+  schedule:
+  - cron: 17 21 14-18 * *
+  - cron: 45 22 19 * *
 permissions:
   contents: read
 concurrency:
@@ -21,7 +24,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
     - uses: actions/setup-python@v5
       with:
@@ -47,12 +50,12 @@ jobs:
           python -m playwright install --only-shell chromium
         fi
     - name: 公開空き状況の検証（予約なし）
-      timeout-minutes: 32
+      timeout-minutes: 42
       env:
         SCHOOL_DISTRICT: ${{ inputs.school_district }}
       shell: bash
       run: |
-        timeout --signal=TERM --kill-after=5s 1890s python -u - <<'PY'
+        timeout --signal=TERM --kill-after=5s 2490s python -u - <<'PY'
         import json, os, re, calendar, time
         from pathlib import Path
         from datetime import date, datetime, timedelta, time as clock
@@ -208,45 +211,65 @@ jobs:
          return {building:clean(document.querySelector('#mansion-select')?.selectedOptions[0]?.textContent),room:clean(document.querySelector('#facility-select')?.selectedOptions[0]?.textContent),rooms:[...document.querySelectorAll('#facility-select option')].map(o=>clean(o.textContent)),rows:t?[...t.rows].map(r=>[...r.cells].map(c=>({text:clean(c.innerText),icons:[...c.querySelectorAll('img')].map(i=>({alt:i.alt,title:i.title,file:new URL(i.src,location.href).pathname.split('/').pop()}))}))):[]};
         }'''
 
+        def room_days(room,expected):
+            # Exact weekday-only category is excluded; special-day categories remain visible.
+            if not re.search(r'体育館|アリーナ',room): return set()
+            if re.search(r'[（(]平日[）)]$',room): return set()
+            if '平日・土曜' in room or '平日・土曜日' in room: return {d for d in expected if d.weekday()==5}
+            if '日曜・祝日' in room and '土曜' not in room: return {d for d in expected if d.weekday()==6}
+            return set(expected)
+
         def school_calendar(page,start,ready,school_name):
             last=shift(start.replace(day=1),1)-timedelta(days=1)
             expected={start+timedelta(days=i) for i in range((last-start).days+1) if (start+timedelta(days=i)).weekday()>=5}
-            dates={}; snapshots=[]
             initial=page.evaluate(GRID)
             print('SCHOOL_ROOM_OPTIONS',json.dumps({'館':school_name,'表示館':initial['building'],'選択施設':initial['room'],'選択肢':initial['rooms'],'行数':len(initial['rows'])},ensure_ascii=False),flush=True)
-            if initial['building']!=school_name: raise RuntimeError('building mismatch: '+initial['building'])
-            def eligible(r):
-                return bool(re.search(r'体育館|アリーナ',r)) and ('平日' not in r or bool(re.search(r'土|日|祝',r)))
-            candidates=[r for r in initial['rooms'] if eligible(r)]
-            if len(candidates)!=1: raise RuntimeError('gym room ambiguous or missing: '+str(candidates))
-            room=candidates[0]
-            if initial['room']!=room:
-                page.locator('#facility-select').select_option(label=room); ready()
-                page.wait_for_timeout(1200)
-            for _ in range(6):
-                grid=page.evaluate(GRID); snapshots.append(grid)
-                if grid['building']!=school_name or grid['room']!=room or len(grid['rows'])<2: raise RuntimeError('school calendar not verified: '+str({'building':grid['building'],'room':grid['room'],'rows':len(grid['rows'])}))
-                cols=grid['rows'][0][1:]
-                for i,c in enumerate(cols,1):
-                    m=re.search(r'(\d+)月(\d+)日',c['text'])
-                    if not m: raise RuntimeError('unknown date header')
-                    month,day=map(int,m.groups()); year=start.year+(month<start.month)
-                    d=date(year,month,day)
-                    if d not in expected: continue
-                    if any(len(r)<=i for r in grid['rows'][1:]): raise RuntimeError('school calendar column missing')
-                    dates[d]={r[0]['text']:r[i]['icons'] for r in grid['rows'][1:]}
-                if expected<=set(dates): break
-                button=page.locator('#next-week')
-                if not button.is_visible() or not button.is_enabled(): break
-                before=grid['rows'][0]
-                button.click(); ready()
+            if initial['building']!=school_name or not initial['rows']: raise RuntimeError('school building/grid mismatch')
+            candidates=[(r,room_days(r,expected)) for r in initial['rooms'] if room_days(r,expected)]
+            if not candidates or len({r for r,_ in candidates})!=len(candidates): raise RuntimeError('no unique volleyball gym room options')
+            def header(grid): return [c['text'] for c in grid['rows'][0]] if grid['rows'] else []
+            baseline=header(initial)
+            def move(button):
+                before=header(page.evaluate(GRID)); loc=page.locator(button)
+                if not loc.is_visible() or not loc.is_enabled(): raise RuntimeError('calendar navigation unavailable: '+button)
+                loc.click(); ready()
+                page.wait_for_function(r'(before) => JSON.stringify([...document.querySelectorAll("#week-info tr:first-child th, #week-info tr:first-child td")].map(c=>c.innerText.trim().replace(/\s+/g," "))) !== JSON.stringify(before)',arg=before,timeout=12000)
+                ready(); page.wait_for_timeout(500)
+            reports=[]
+            for room,wanted in candidates:
                 try:
-                    page.wait_for_function('(before) => JSON.stringify([...document.querySelectorAll("#week-info tr:first-child th, #week-info tr:first-child td")].map(c=>c.innerText.trim().replace(/\\s+/g," "))) !== JSON.stringify(before)',arg=[c['text'] for c in before],timeout=10000)
-                except Exception: pass
-                page.wait_for_timeout(800)
-                if page.evaluate(GRID)['rows'][:1]==grid['rows'][:1]: break
-            missing=sorted(str(d) for d in expected-set(dates))
-            return {'館':school_name,'対象月':start.strftime('%Y-%m'),'取得日数':len(dates),'予定日数':len(expected),'未取得日':missing,'日別状態':{str(d):v for d,v in sorted(dates.items())},'画面':snapshots}
+                    if page.evaluate(GRID)['room']!=room:
+                        with page.expect_response(lambda r:urlsplit(r.url).path.endswith('/rsvWOpeInstSrchVacantAjaxAction.do'),timeout=15000) as result:
+                            page.locator('#facility-select').select_option(label=room)
+                        if result.value.status!=200: raise RuntimeError('room calendar HTTP failure')
+                        result.value.body(); ready(); page.wait_for_timeout(800)
+                    # Restore initial week if changing the room retained the later week.
+                    for _ in range(6):
+                        if header(page.evaluate(GRID))==baseline: break
+                        move('#last-week')
+                    if header(page.evaluate(GRID))!=baseline: raise RuntimeError('calendar initial week not restored')
+                    dates={}; snapshots=[]
+                    for _ in range(6):
+                        grid=page.evaluate(GRID); snapshots.append(grid)
+                        if grid['building']!=school_name or grid['room']!=room or len(grid['rows'])<2: raise RuntimeError('room calendar identity mismatch')
+                        for i,c in enumerate(grid['rows'][0][1:],1):
+                            m=re.search(r'(\d+)月(\d+)日',c['text'])
+                            if not m: raise RuntimeError('unknown date header')
+                            month,day=map(int,m.groups())
+                            if month!=start.month: continue
+                            day=date(start.year,month,day)
+                            if day not in wanted: continue
+                            if any(len(r)<=i for r in grid['rows'][1:]): raise RuntimeError('calendar column missing')
+                            periods={r[0]['text']:r[i]['icons'] for r in grid['rows'][1:]}
+                            if len(periods)!=len(grid['rows'])-1 or not all(periods): raise RuntimeError('ambiguous time period labels')
+                            dates[day]=periods
+                        if wanted<=set(dates): break
+                        move('#next-week')
+                    missing=sorted(str(x) for x in wanted-set(dates))
+                    reports.append({'施設':room,'取得日数':len(dates),'予定日数':len(wanted),'未取得日':missing,'日別状態':{str(k):v for k,v in sorted(dates.items())},'画面':snapshots})
+                except Exception as e:
+                    reports.append({'施設':room,'取得日数':0,'予定日数':len(wanted),'未取得日':sorted(map(str,wanted)),'エラー':str(e)[:250],'日別状態':{}})
+            return {'館':school_name,'対象月':start.strftime('%Y-%m'),'予定施設数':len(candidates),'取得施設数':sum(not r.get('エラー') and not r['未取得日'] for r in reports),'施設別':reports}
 
         def scan(browser,district,code,start,control=False,diagnostic=False,time_mode="parts",calendar_only=False,school_name=None):
             end=start+timedelta(days=30)
@@ -319,7 +342,7 @@ jobs:
                 if calendar_only:
                     report=school_calendar(page,start,ready,school_name or '清水台小学校')
                     (OUT/f'school-{code}-{start}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-                    print('SCHOOL_INDEPENDENT',json.dumps({k:v for k,v in report.items() if k not in ('画面','日別状態')},ensure_ascii=False),flush=True)
+                    print('SCHOOL_INDEPENDENT',json.dumps({k:v for k,v in report.items() if k not in ('画面','日別状態','施設別')},ensure_ascii=False),flush=True)
                     return report
                 tab=page.get_by_role('link',name='日付順',exact=True); tab.wait_for(state='visible')
                 with page.expect_response(lambda r:'rsvWOpeUnreservedSearchAjaxAction.do' in urlsplit(r.url).path,timeout=25000) as wait:
@@ -377,14 +400,16 @@ jobs:
             for school in schools:
                 try:
                     r=scan(browser,school['district'],school['code'],month,control=True,calendar_only=True,school_name=school['name'])
-                    if not r['日別状態'] or r['未取得日']: raise RuntimeError('calendar dates missing: '+str(r['未取得日']))
-                    for d,day in r['日別状態'].items():
-                        for period,icons in day.items():
-                            labels=[i['alt'] for i in icons]
-                            for label in labels: states[label]=states.get(label,0)+1
-                            if not labels or any(label not in ('保守日','予約あり','受付期間外') for label in labels):
-                                unknown.append({'地区':school['district'],'館':school['name'],'日付':d,'時間帯':period,'表示':labels})
-                    results.append({'地区':school['district'],'館':school['name'],'code':school['code'],'取得日数':r['取得日数']})
+                    for room in r['施設別']:
+                        for day,periods in room['日別状態'].items():
+                            for period,icons in periods.items():
+                                labels=[i['alt'] for i in icons]
+                                for label in labels: states[label]=states.get(label,0)+1
+                                if not labels or any(label not in ('保守日','予約あり','受付期間外') for label in labels):
+                                    unknown.append({'地区':school['district'],'館':school['name'],'施設':room['施設'],'日付':day,'時間帯':period,'表示':labels})
+                    if r['取得施設数']!=r['予定施設数']:
+                        raise RuntimeError('room coverage incomplete: '+str([{k:v for k,v in room.items() if k in ('施設','未取得日','エラー')} for room in r['施設別'] if room.get('エラー') or room['未取得日']]))
+                    results.append({'地区':school['district'],'館':school['name'],'code':school['code'],'取得施設数':r['取得施設数']})
                 except Exception as e:
                     failures.append({'地区':school['district'],'館':school['name'],'code':school['code'],'エラー':str(e)[:300]})
                     print('SCHOOL_ERROR',json.dumps(failures[-1],ensure_ascii=False),flush=True)
@@ -414,3 +439,4 @@ jobs:
         path: shinagawa-results/
         if-no-files-found: warn
         retention-days: 2
+    if: github.event_name == 'workflow_dispatch' || vars.SHINAGAWA_SCHOOL_ENABLED == 'true'

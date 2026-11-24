@@ -1,8 +1,19 @@
-name: 品川区・通常空き検索（手動検証）
+name: 品川区・通常空き監視
 'on':
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 実行モード
+        type: choice
+        default: dry_run
+        options:
+        - dry_run
+        - test_line
+        - notify
+  schedule:
+  - cron: 1-56/5 * * * *
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: shinagawa-check
   cancel-in-progress: false
@@ -11,9 +22,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
+    - uses: actions/checkout@v4
+      if: success() && (github.event_name == 'schedule' || inputs.mode == 'notify' || inputs.mode == 'test_line')
+      with:
+        ref: main
     - uses: actions/setup-python@v5
       with:
         python-version: '3.12'
+      if: inputs.mode != 'test_line'
     - name: ブラウザ準備
       timeout-minutes: 2
       shell: bash
@@ -34,7 +50,8 @@ jobs:
           echo "No system browser; installing headless shell only"
           python -m playwright install --only-shell chromium
         fi
-    - name: 公開空き状況の検証（予約なし）
+      if: inputs.mode != 'test_line'
+    - name: 公開空き検索（予約操作なし）
       timeout-minutes: 10
       env:
         AUDIT_MODE: '0'
@@ -335,7 +352,7 @@ jobs:
                 if TODAY<=date.fromisoformat(s['日付'])<=horizon:
                     slots[tuple(s[k] for k in ('地区','館','施設','日付','開始','終了'))]=s
         failed=[r for r in reports if r.get('エラー') or r.get('注意')]
-        result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS)*2,'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'検索結果':reports,'診断':diagnostics,'失敗検索数':len(failed),'網羅性':'検証中'}
+        result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS)*2,'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'検索結果':reports,'診断':diagnostics,'失敗検索数':len(failed),'網羅性':'API件数照合済み'}
         result['学校枠']=[s for s in result['取得枠'] if s['種別']=='学校']
         result['学校以外枠']=[s for s in result['取得枠'] if s['種別']!='学校']
         (OUT/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -345,11 +362,92 @@ jobs:
             for s in result['取得枠']: f.write(f"- {s['日付']} {s['開始']}–{s['終了']} {s['館']} {s['施設']} {s['予約状態']}\n")
         if failed or any(r.get('エラー') or r.get('注意') for r in diagnostics.values()): raise SystemExit('Partial or ambiguous results: inspect report')
         PY
+      if: inputs.mode != 'test_line'
+    - name: LINE通知・新規枠判定
+      if: success() && (github.event_name == 'schedule' || inputs.mode == 'notify' || inputs.mode == 'test_line')
+      env:
+        LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+        LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        RUN_MODE: ${{ inputs.mode || 'notify' }}
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, uuid
+        from pathlib import Path
+        from urllib.request import Request,urlopen
+        from urllib.error import HTTPError
+        from datetime import date
+
+        state=Path('.shinagawa-notified.json')
+        FIELDS=('地区','館','施設','日付','開始','終了')
+        def key(r):
+            return hashlib.sha256(json.dumps([r[k] for k in FIELDS],ensure_ascii=False).encode()).hexdigest()
+
+        def push(message,retry_key=None):
+            token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'); recipient=os.environ.get('LINE_USER_ID')
+            if not token or not recipient: raise RuntimeError('LINE secrets missing')
+            headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}
+            if retry_key: headers['X-Line-Retry-Key']=retry_key
+            req=Request('https://api.line.me/v2/bot/message/push',data=json.dumps({'to':recipient,'messages':[{'type':'text','text':message}]},ensure_ascii=False).encode(),headers=headers,method='POST')
+            try:
+                with urlopen(req,timeout=20) as res:
+                    if res.status!=200: raise RuntimeError('LINE push failure')
+            except HTTPError as e:
+                if retry_key and e.code==409 and e.headers.get('X-Line-Accepted-Request-Id'): return
+                raise RuntimeError('LINE HTTP '+str(e.code)) from None
+
+        def main():
+            if os.environ['RUN_MODE']=='test_line':
+                push('🏐 品川区・空き通知 接続テスト成功'); print('LINE_TEST_OK'); return
+            data=json.loads(Path('shinagawa-results/result.json').read_text())
+            if data['失敗検索数'] or len(data['検索結果'])!=data['検索予定'] or any(r.get('注意') or r.get('エラー') for r in data['検索結果']):
+                raise RuntimeError('incomplete search: notifications and state unchanged')
+            old=json.loads(state.read_text()) if state.exists() else {'version':1,'slots':[],'revision':'initial'}
+            if old.get('version')!=1 or not isinstance(old.get('slots'),list): raise RuntimeError('invalid previous state')
+            # School pre-opening results belong in the monthly workflow, not cancel alerts.
+            rows={key(r):r for r in data['取得枠'] if r['予約状態']!='受付開始前'}
+            new=[r for k,r in rows.items() if k not in set(old['slots'])]
+            current={'version':1,'slots':sorted(rows),'revision':old.get('revision','initial')}
+            if current['slots']!=old['slots']:
+                current['revision']=str(uuid.uuid5(uuid.NAMESPACE_URL,json.dumps([old,current],sort_keys=True)))
+            if new:
+                lines=[f'🏐 品川区 新規空き：{len(new)}枠（公開表示）']
+                link='\n予約サイト：https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
+                runlink=os.environ['GITHUB_SERVER_URL']+'/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID']
+                for r in sorted(new,key=lambda x:(x['日付'],x['開始'],x['館'],x['施設'])):
+                    label=f"{r['日付']} {r['開始']}〜{r['終了']}\n{r['館']} {r['施設']}（{r['地区']}）\n{r['予約状態']}"
+                    if len(('\n\n'.join(lines+[label])+link+runlink).encode('utf-16-le'))//2>4200:
+                        lines.append('残りの枠：'+runlink); break
+                    lines.append(label)
+                # Retry the same transition without repeating an already accepted LINE push.
+                retry=current['revision']
+                push('\n\n'.join(lines)+link,retry)
+            if current!=old or not state.exists(): state.write_text(json.dumps(current,ensure_ascii=False,indent=2)+'\n')
+            print('NEW_SLOTS',len(new),'CURRENT_SLOTS',len(rows))
+        if __name__=='__main__': main()
+        PY
+    - name: 通知済み状態の保存
+      if: success() && (github.event_name == 'schedule' || inputs.mode == 'notify')
+      shell: bash
+      run: |
+        set -euo pipefail
+        git add -- .shinagawa-notified.json
+        if git diff --cached --quiet; then exit 0; fi
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git commit -m 'Update Shinagawa availability state'
+        for attempt in 1 2 3; do
+          if git push origin HEAD:main; then exit 0; fi
+          git pull --rebase origin main
+          sleep 2
+        done
+        exit 1
     - name: 結果を保存
-      if: always()
+      if: always() && inputs.mode != 'test_line'
       uses: actions/upload-artifact@v4
       with:
         name: shinagawa-check-results
         path: shinagawa-results/
         if-no-files-found: warn
         retention-days: 2
+    if: github.event_name == 'workflow_dispatch' || vars.SHINAGAWA_AUTO_ENABLED == 'true'
