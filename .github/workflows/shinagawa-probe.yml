@@ -1,6 +1,11 @@
-name: 品川区施設検索・初回診断
+name: 品川区施設検索・全地区検証
 on:
   workflow_dispatch:
+    inputs:
+      test_line:
+        description: 取得結果のテスト通知（手動のみ）
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -9,7 +14,7 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 9
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -34,176 +39,221 @@ jobs:
             echo "No system browser; installing headless shell only"
             python -m playwright install --only-shell chromium
           fi
-      - name: 公開検索結果の診断（日付順・荏原地区・予約なし）
-        timeout-minutes: 3
+      - name: 全地区の公開空き検索（予約なし）
+        timeout-minutes: 7
         shell: bash
         run: |
-          timeout --signal=TERM --kill-after=5s 150s python -u - <<'PY'
-          import json
-          import os
+          timeout --signal=TERM --kill-after=5s 390s python -u - <<'PY'
+          import json, os, re, calendar, time
           from pathlib import Path
-          from urllib.parse import urlsplit, parse_qsl
+          from datetime import date, datetime, timedelta, time as clock
+          from zoneinfo import ZoneInfo
+          from urllib.parse import urlsplit, parse_qs
           from playwright.sync_api import sync_playwright
-
-          URL = 'https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
-          out = Path('shinagawa-diagnostics')
-          out.mkdir(exist_ok=True)
-          SNAPSHOT = r'''() => {
-            const clean = (s,n=200) => (s || '').replace(/\s+/g,' ').trim().slice(0,n);
-            const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length) && getComputedStyle(e).visibility !== 'hidden';
-            return {
-              title: document.title,
-              text: clean(document.body?.innerText,7000),
-              selects: [...document.querySelectorAll('select')].map(e=>({id:e.id,name:e.name,visible:visible(e),selected:e.selectedOptions[0]?.textContent,options:[...e.options].map(o=>({text:clean(o.textContent),value:o.value}))})),
-              inputs: [...document.querySelectorAll('input:not([type=hidden])')].map(e=>({id:e.id,name:e.name,type:e.type,visible:visible(e),checked:e.checked,labels:[...(e.labels||[])].map(l=>clean(l.textContent))})),
-              controls: [...document.querySelectorAll('a,button,[role=button],input[type=button],input[type=submit]')].filter(visible).slice(0,100).map(e=>({tag:e.tagName,id:e.id,text:clean(e.innerText||e.value||e.getAttribute('aria-label')),title:clean(e.title)})),
-              tables: [...document.querySelectorAll('table')].filter(visible).slice(0,30).map(t=>({id:t.id,classes:t.className,row_count:t.rows.length,rows:[...t.rows].slice(0,100).map(r=>[...r.cells].slice(0,45).map(c=>({tag:c.tagName,text:clean(c.innerText,120),title:clean(c.title),classes:c.className,rowspan:c.rowSpan,colspan:c.colSpan,images:[...c.querySelectorAll('img')].slice(0,4).map(i=>({alt:clean(i.alt),title:clean(i.title),src:new URL(i.src,location.href).pathname.split('/').pop()})),labels:[...c.querySelectorAll('[aria-label]')].slice(0,4).map(e=>clean(e.getAttribute('aria-label')))})))}))
-            };
+          
+          URL='https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
+          DISTRICTS={'荏原':'1100_0','大井':'1200_0','大崎':'1300_0','品川':'1400_0','八潮':'1500_0'}
+          PURPOSE='31000000_31010300'
+          DAYS=('monday','tuesday','wednesday','thursday','friday','saturday','sunday','holiday')
+          JST=ZoneInfo('Asia/Tokyo'); NOW=datetime.now(JST); TODAY=NOW.date()
+          OUT=Path('shinagawa-results'); OUT.mkdir(exist_ok=True)
+          
+          def shift(d,n):
+              y,m=divmod(d.year*12+d.month-1+n,12)
+              return date(y,m+1,min(d.day,calendar.monthrange(y,m+1)[1]))
+          
+          def classify(building, room, d):
+              if re.search(r'小学校|中学校|学園',building):
+                  if d > shift(TODAY.replace(day=1),2)-timedelta(days=1): return None
+                  opening=datetime.combine(shift(d.replace(day=20),-1),clock(9),JST)
+                  end=d-timedelta(days=7)
+                  label='学校'
+              elif building in ('総合体育館','戸越体育館','スクエア荏原') and (building!='スクエア荏原' or 'アリーナ' in room):
+                  opening=datetime.combine(shift(d,-2),clock(10),JST)
+                  end=d-timedelta(days=1); label='区立体育館'
+              else:
+                  return {'種別':'その他','予約状態':'個別確認','受付開始':None}
+              # Public vacancy is not proof of account-specific eligibility.
+              status='受付開始前' if NOW<opening else 'オンライン期限後・要確認' if TODAY>end else '受付期間内（資格要確認）'
+              return {'種別':label,'予約状態':status,'受付開始':opening.isoformat()}
+          
+          def parse_rows(blocks, district, start, end):
+              slots=[]; errors=[]
+              for block in blocks:
+                  try:
+                      d=datetime.strptime(block['day'],'%Y%m%d').date()
+                      if not start<=d<=end or d.weekday()<5: raise ValueError('date outside query')
+                      for row in block['rows']:
+                          if len(row)!=4 or not row[0] or not row[1]: raise ValueError('unrecognized row structure')
+                          b,r,t,_=row
+                          matches=re.findall(r'(\d{1,2})時(\d{2})分\s*[～〜~－–-]\s*(\d{1,2})時(\d{2})分',t)
+                          if not matches: raise ValueError('unrecognized time')
+                          for h,m,h2,m2 in matches:
+                              a,z=int(h)*60+int(m),int(h2)*60+int(m2)
+                              if not 0<=a<z<=1440 or int(m)>59 or int(m2)>59: raise ValueError('invalid time')
+                              kind=classify(b,r,d)
+                              if kind is not None:
+                                  slots.append({'地区':district,'館':b,'施設':r,'日付':d.isoformat(),'開始':f'{int(h):02}:{m}','終了':f'{int(h2):02}:{m2}','分':z-a,**kind})
+                  except Exception as e: errors.append(str(e))
+              return slots,errors
+          
+          # Build on the public date-order screen verified in v6. No login or booking.
+          EXTRACT=r'''() => {
+           const clean=s=>(s||'').replace(/\s+/g,' ').trim();
+           const dates=[...document.querySelectorAll('a[id^="a_"]')].filter(a=>/^a_\d{8}$/.test(a.id));
+           const tables=[...document.querySelectorAll('table[id^="dt_free-info-"]')];
+           const blocks=[]; const errors=[];
+           for(const table of tables){
+             let a=null;
+             for(let p=table.parentElement;p && p!==document.body;p=p.parentElement){
+               const ds=[...p.querySelectorAll('a[id^="a_"]')].filter(e=>/^a_\d{8}$/.test(e.id));
+               if(ds.length===1){a=ds[0];break;}
+               if(ds.length>1)break;
+             }
+             if(!a && dates.length===1 && tables.length===1)a=dates[0];
+             if(!a){errors.push('date/table mapping unresolved');continue;}
+             const rows=[...table.rows].slice(1).map(r=>[...r.cells].map(c=>clean(c.innerText||c.textContent)));
+             blocks.push({day:a.id.slice(2),rows});
+           }
+           const controls=[...document.querySelectorAll('a,button')].filter(e=>e.getClientRects().length && !e.disabled).map(e=>clean(e.innerText));
+           return {blocks,errors,dates:dates.map(a=>a.id.slice(2)),tableCount:tables.length,body:clean(document.body.innerText).slice(0,1400),more:controls.filter(t=>/^(次へ|次のページ|もっと見る|さらに表示|続きを表示|次の\d+件)$/.test(t))};
           }'''
-          def snapshot(page, label):
-              report = []
-              for frame in page.frames:
-                  try:
-                      report.append({'path':urlsplit(frame.url).path, **frame.evaluate(SNAPSHOT)})
-                  except Exception as e:
-                      report.append({'error':type(e).__name__})
-              (out/(label+'.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-              # Keep public logs bounded; detailed table samples are in the artifact.
-              compact = []
-              for f in report:
-                  compact.append({**{k:v for k,v in f.items() if k not in ('selects','tables')},'selects':[{k:v for k,v in s.items() if k!='options'} for s in f.get('selects',[])],'tables':[{**t,'rows':t['rows'][:4]} for t in f.get('tables',[])]})
-              print('SHINAGAWA_RESULT_BEGIN',label,flush=True)
-              print(json.dumps(compact,ensure_ascii=False),flush=True)
-              print('SHINAGAWA_RESULT_END',label,flush=True)
-              for f in report:
-                  summary = {'stage':label,'selects':f.get('selects',[]),'tables':[]}
-                  for t in f.get('tables',[]):
-                      summary['tables'].append({'id':t['id'],'rows':t['row_count'],
-                          'sample':[[{'text':c['text'],'title':c['title'],'alt':[i['alt'] for i in c['images']]} for c in row] for row in t['rows'][:6]]})
-                  print('TABLE_SUMMARY',json.dumps(summary,ensure_ascii=False),flush=True)
-              try:
-                  page.screenshot(path=str(out/(label+'.png')),full_page=True,timeout=10000)
-              except Exception as e:
-                  print('SCREENSHOT_ERROR',type(e).__name__,flush=True)
-          with sync_playwright() as p:
-              chrome = os.environ.get('SHINAGAWA_CHROME')
-              print('BROWSER_START', 'system' if chrome else 'headless-shell', flush=True)
-              browser = p.chromium.launch(**({'executable_path': chrome} if chrome else {}), timeout=15000)
-              page = browser.new_page(locale='ja-JP',timezone_id='Asia/Tokyo',viewport={'width':1440,'height':1000})
-              responses=[]
+          
+          def scan(browser,district,code,start):
+              end=start+timedelta(days=30)
+              page=browser.new_page(locale='ja-JP',timezone_id='Asia/Tokyo',viewport={'width':1440,'height':1000})
+              page.set_default_timeout(10000)
+              calls=[]; responses=[]
               def observe(r):
-                  if r.request.resource_type in ('document','xhr','fetch') and urlsplit(r.url).hostname == urlsplit(URL).hostname and len(responses)<80:
-                      responses.append({'method':r.request.method,'path':urlsplit(r.url).path,'status':r.status,'form_keys':sorted({k for k,v in parse_qsl(r.request.post_data or '',keep_blank_values=True)}) if r.request.method=='POST' and 'application/x-www-form-urlencoded' in r.request.headers.get('content-type','') else []})
+                  if 'rsvWOpeUnreservedSearchAjaxAction.do' in urlsplit(r.url).path:
+                      q=parse_qs(r.request.post_data or '')
+                      calls.append({'status':r.status,'offset':q.get('offset',[]),'limit':q.get('limit',[])})
+                      responses.append(r)
               page.on('response',observe)
-              page.set_default_timeout(8000)
               try:
-                  print('HOME_REQUEST',flush=True)
-                  response=page.goto(URL,wait_until='domcontentloaded',timeout=20000)
-                  print('HOME_HTTP',response.status if response else None,flush=True)
-                  if response is None or response.status>=400:
-                      raise RuntimeError('home HTTP failure')
-                  def ready():
-                      page.locator('#loadmsg').wait_for(state='hidden',timeout=10000)
-
-                  def checked_by_label(control):
-                      target = page.locator('#'+control)
+                  res=page.goto(URL,wait_until='domcontentloaded',timeout=20000)
+                  if not res or res.status!=200: raise RuntimeError('home HTTP failure')
+                  def ready(): page.locator('#loadmsg').wait_for(state='hidden',timeout=12000)
+                  def checked(name):
+                      target=page.locator('#'+name)
                       if not target.is_checked():
-                          ready()
-                          label = page.locator('label[for="'+control+'"]')
-                          if label.count() == 1 and label.is_visible():
-                              label.click(timeout=10000)
-                          else:
-                              target.click(timeout=10000)
-                          ready()
-                      if not target.is_checked():
-                          raise RuntimeError('selection not applied: '+control)
-
-                  page.locator('#bname').wait_for(state='visible',timeout=15000)
-                  ready()
-                  # Use the actual public form and its detailed date options.
-                  print('SELECT_MONTH',flush=True)
-                  checked_by_label('thismonth')
-                  print('MONTH_SELECTED',flush=True)
-                  print('SELECT_DISTRICT',flush=True)
-                  page.locator('#bname').select_option(value='1100_0',timeout=15000)
-                  ready()
-                  print('SELECT_PURPOSE',flush=True)
-                  page.locator('#purpose').select_option(value='31000000_31010300',timeout=15000)
-                  ready()
-                  print('DISTRICT_AND_PURPOSE_SELECTED',flush=True)
-                  print('SELECT_WEEKENDS',flush=True)
-                  if not page.locator('#saturday').is_visible():
-                      page.locator('#collapse-when').click(timeout=10000)
-                      ready()
-                  page.locator('#saturday').wait_for(state='attached',timeout=10000)
-                  # Detailed options may change the period mode. Verify the actual
-                  # period and weekday controls before any public search submission.
-                  if page.locator('#days').is_visible():
-                      page.locator('#days').select_option(value='31',timeout=10000)
-                      ready()
-                  for day in ('monday','tuesday','wednesday','thursday','friday','holiday'):
-                      target = page.locator('#'+day)
-                      if target.is_checked():
-                          label = page.locator('label[for="'+day+'"]')
-                          ready()
-                          if label.count() == 1 and label.is_visible():
-                              label.click(timeout=10000)
-                          else:
-                              target.click(timeout=10000)
-                          ready()
-                  for day in ('saturday','sunday'):
-                      checked_by_label(day)
-                  days = page.locator('#days')
-                  period_ok = days.input_value() == '31' if days.is_visible() else page.locator('#thismonth').is_checked()
-                  chosen = [day for day in ('monday','tuesday','wednesday','thursday','friday','saturday','sunday','holiday') if page.locator('#'+day).is_checked()]
-                  print('SELECTED_CONDITIONS',json.dumps({'period_days':days.input_value(),'month_radio':page.locator('#thismonth').is_checked(),'weekdays':chosen,'district':page.locator('#bname').input_value(),'purpose':page.locator('#purpose').input_value()},ensure_ascii=False),flush=True)
-                  if not period_ok or chosen != ['saturday','sunday'] or page.locator('#bname').input_value()!='1100_0' or page.locator('#purpose').input_value()!='31000000_31010300':
-                      raise RuntimeError('search selection mismatch')
-                  snapshot(page,'before-search')
-                  # Only the verified visible public search button is clicked. No login or booking.
-                  ready()
-                  print('SUBMIT_PUBLIC_SEARCH',flush=True)
-                  page.locator('#btn-go').click(timeout=10000)
-                  try:
-                      page.wait_for_load_state('networkidle',timeout=12000)
-                  except Exception:
-                      pass
-                  ready()
-                  page.wait_for_timeout(1000)
-                  snapshot(page,'after-search')
-                  print('PUBLIC_SEARCH_CLICKED',flush=True)
-                  # The previous run confirmed this is a public result navigation tab.
-                  # Test the date-oriented view first to avoid a request per room.
-                  date_tab = page.get_by_role('link',name='日付順',exact=True)
-                  if date_tab.count()!=1 or not date_tab.is_visible():
-                      raise RuntimeError('date-order tab unavailable')
-                  print('OPEN_DATE_ORDER',flush=True)
-                  ready()
-                  date_tab.click(timeout=10000)
-                  try:
-                      page.wait_for_load_state('networkidle',timeout=12000)
-                  except Exception:
-                      pass
-                  ready()
-                  page.wait_for_timeout(1200)
-                  snapshot(page,'date-order')
-                  print('DATE_ORDER_INSPECTED',flush=True)
-                  if not any(r['method']=='POST' and r['status']<400 for r in responses) and not any(r['path'] != '/shinagawa/web/index.jsp' and r['status']<400 for r in responses):
-                      print('WARNING: search response not independently confirmed',flush=True)
-              except Exception as e:
-                  print('PROBE_ERROR',type(e).__name__,flush=True)
-                  snapshot(page,'error')
-                  raise
-              finally:
-                  print('SHINAGAWA_HTTP',json.dumps(responses,ensure_ascii=False),flush=True)
-                  browser.close()
+                          ready(); page.locator('label[for="'+name+'"]').click(); ready()
+                      if not target.is_checked(): raise RuntimeError('checkbox not selected: '+name)
+                  page.locator('#bname').wait_for(state='visible'); ready(); checked('thismonth')
+                  page.locator('#bname').select_option(value=code); ready()
+                  page.locator('#purpose').select_option(value=PURPOSE); ready()
+                  if not page.locator('#saturday').is_visible(): page.locator('#collapse-when').click(); ready()
+                  if page.locator('#days').is_visible(): page.locator('#days').select_option('31'); ready()
+                  if start!=TODAY:
+                      day=page.locator('#daystart')
+                      if not day.is_visible(): raise RuntimeError('custom start unavailable')
+                      day.fill(start.isoformat()); day.press('Tab'); ready()
+                  for name in DAYS:
+                      target=page.locator('#'+name)
+                      if target.is_checked() != (name in ('saturday','sunday')):
+                          ready(); page.locator('label[for="'+name+'"]').click(); ready()
+                  actual=page.locator('#daystart').input_value()
+                  chosen=[n for n in DAYS if page.locator('#'+n).is_checked()]
+                  if (actual!=start.isoformat() or page.locator('#days').input_value()!='31' or chosen!=['saturday','sunday'] or page.locator('#bname').input_value()!=code or page.locator('#purpose').input_value()!=PURPOSE):
+                      raise RuntimeError('condition mismatch: '+str({'date':actual,'days':page.locator('#days').input_value(),'weekdays':chosen}))
+                  print('SEARCH',district,start,flush=True)
+                  page.locator('#btn-go').click(); ready()
+                  tab=page.get_by_role('link',name='日付順',exact=True); tab.wait_for(state='visible')
+                  with page.expect_response(lambda r:'rsvWOpeUnreservedSearchAjaxAction.do' in urlsplit(r.url).path,timeout=25000) as wait:
+                      tab.click()
+                  if wait.value.status!=200: raise RuntimeError('date-order HTTP failure')
+                  ready(); page.wait_for_timeout(800)
+                  # Expand only the public results, never a reservation control.
+                  expand=page.get_by_role('button',name='すべて開く',exact=True)
+                  if expand.count()==1 and expand.is_visible(): expand.click(); ready()
+                  # Trigger bounded lazy loading through normal scrolling; do not forge requests.
+                  for _ in range(5):
+                      before=page.locator('table[id^="dt_free-info-"]').count()
+                      page.evaluate('window.scrollTo(0,document.body.scrollHeight)'); page.wait_for_timeout(650); ready()
+                      if page.locator('table[id^="dt_free-info-"]').count()==before: break
+                  data=page.evaluate(EXTRACT)
+                  meta=[]
+                  for response in responses:
+                      try:
+                          payload=response.json()
+                          if isinstance(payload,dict):
+                              meta.append({'keys':list(payload)[:50], 'counts':{k:v for k,v in payload.items() if isinstance(v,int) and re.search('total|count|limit|offset|size',k,re.I)},'lists':{k:len(v) for k,v in payload.items() if isinstance(v,list)}})
+                          elif isinstance(payload,list): meta.append({'list_length':len(payload)})
+                      except Exception: meta.append({'format':'non-json'})
+                  slots,errors=parse_rows(data['blocks'],district,start,end)
+                  errors+=data['errors']
+                  expected=f'{start.year}年{start.month}月{start.day}日'
+                  if expected not in data['body'] or '土日曜' not in data['body'] or '1か月表示' not in data['body'] or district+'地区' not in data['body'] or 'バレーボール' not in data['body']:
+                      errors.append('server search condition echo not verified')
+                  if set(data['dates'])!=set(b['day'] for b in data['blocks']): errors.append('date sections not fully mapped')
+                  if data['more']: errors.append('pagination control present')
+                  if not data['blocks'] and not re.search(r'空き.*(ありません|ございません)|該当.*(ありません|ございません)|0件',data['body']): errors.append('empty result not explicitly confirmed')
+                  # Until pagination metadata is independently verified, report observed slots only.
+                  report={'地区':district,'開始日':start.isoformat(),'終了日':end.isoformat(),'空き枠':slots,'注意':errors,'通信':calls,'応答概要':meta,'日付見出し':data['dates'],'表数':data['tableCount'],'表示抜粋':data['body'],'網羅性':'要検証'}
+                  (OUT/f'{code}-{start}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                  print('DISTRICT_RESULT',json.dumps(report,ensure_ascii=False),flush=True)
+                  return report
+              finally: page.close()
+          
+          # 31-day chunks: cover both the next calendar month and the two-month horizon.
+          horizon=max(shift(TODAY,2),shift(TODAY.replace(day=1),2)-timedelta(days=1))
+          starts=[]; d=TODAY
+          while d<=horizon: starts.append(d); d+=timedelta(days=31)
+          reports=[]
+          with sync_playwright() as p:
+              chrome=os.environ.get('SHINAGAWA_CHROME')
+              browser=p.chromium.launch(**({'executable_path':chrome} if chrome else {}),timeout=15000)
+              try:
+                  for start in starts:
+                      for district,code in DISTRICTS.items():
+                          try: reports.append(scan(browser,district,code,start))
+                          except Exception as e:
+                              report={'地区':district,'開始日':start.isoformat(),'エラー':str(e)[:400],'空き枠':[]}
+                              reports.append(report); print('DISTRICT_ERROR',json.dumps(report,ensure_ascii=False),flush=True)
+                          finally: (OUT/'progress.json').write_text(json.dumps(reports,ensure_ascii=False,indent=2),encoding='utf-8')
+                          time.sleep(1)
+              finally: browser.close()
+          slots={}
+          for r in reports:
+              for s in r['空き枠']:
+                  if TODAY<=date.fromisoformat(s['日付'])<=horizon:
+                      slots[tuple(s[k] for k in ('館','施設','日付','開始','終了'))]=s
+          result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS),'検索結果':reports,'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'網羅性':'検証中（空きなしの断定禁止）'}
+          (OUT/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_RESULT',json.dumps({k:v for k,v in result.items() if k!='検索結果'},ensure_ascii=False),flush=True)
+          lines=[f"## 品川区 空き検索（検証版）",f"取得 {len(slots)} 件 / 検索 {len(reports)} 回（網羅性検証中）",'|日付|地区|施設|時間|受付状態|','|---|---|---|---|---|']
+          for s in result['取得枠']: lines.append(f"|{s['日付']}|{s['地区']}|{s['館']} {s['施設']}|{s['開始']}–{s['終了']}|{s['予約状態']}|")
+          for r in reports:
+              if r.get('エラー') or r.get('注意'): lines.append(f"- 要確認: {r['地区']} {r['開始日']} {r.get('エラー',r.get('注意'))}")
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f: f.write('\n'.join(lines)+'\n')
+          if any(r.get('エラー') or r.get('注意') for r in reports): raise SystemExit('Partial or ambiguous results: inspect report')
           PY
-      - name: 診断結果を保存（失敗時も実行）
+      - name: 検証結果のLINEテスト通知
+        if: ${{ success() && inputs.test_line }}
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          d=json.loads(Path('shinagawa-results/result.json').read_text())
+          slots=d['取得枠']
+          msg=f"🏐 品川区 空き検索テスト：取得 {len(slots)}件（網羅性検証中）"
+          for s in slots[:15]:
+              msg+=f"\n{s['日付']} {s['開始']}–{s['終了']} {s['館']} {s['施設']} [{s['予約状態']}]"
+          if len(slots)>15: msg+='\nほかの枠はActionsの実行結果を確認'
+          token=os.environ['LINE_CHANNEL_ACCESS_TOKEN']; user=os.environ['LINE_USER_ID']
+          if not token or not user: raise SystemExit('LINE secrets missing')
+          body=json.dumps({'to':user,'messages':[{'type':'text','text':msg}]},ensure_ascii=False).encode()
+          req=urllib.request.Request('https://api.line.me/v2/bot/message/push',data=body,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+          with urllib.request.urlopen(req,timeout=15) as r: print('LINE HTTP',r.status)
+          PY
+      - name: 検証結果を保存
         if: always()
-        timeout-minutes: 1
         uses: actions/upload-artifact@v4
         with:
-          name: shinagawa-public-diagnostics
-          path: shinagawa-diagnostics/
+          name: shinagawa-public-results
+          path: shinagawa-results/
           if-no-files-found: warn
           retention-days: 2
