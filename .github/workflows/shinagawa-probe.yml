@@ -23,34 +23,100 @@ jobs:
         run: |
           python - <<'PY'
           import json
-          from playwright.sync_api import sync_playwright
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          from playwright.sync_api import sync_playwright, Error
+
           URL = 'https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
+          out = Path('shinagawa-diagnostics')
+          out.mkdir(exist_ok=True)
+
+          # Never log cookies, hidden field values, credentials or URL query strings.
+          def safe_url(url):
+              parts = urlsplit(url)
+              return parts.path if parts.scheme in ('http','https') else parts.scheme
+
+          def snapshot(page, label):
+              frames = []
+              for frame in page.frames:
+                  try:
+                      data = frame.evaluate(r'''() => {
+                        const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+                        const clean = s => (s || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+                        const controls = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit],li')].map(e => ({tag:e.tagName,id:e.id,text:clean(e.innerText || e.textContent || e.value),visible:vis(e),href:e.tagName === 'A' && /^https?:/.test(e.href) ? new URL(e.href).pathname : ''})).filter(e => /空き|検索|施設|目的|選択|条件|期間|メニュー/.test(e.text)).slice(0,100);
+                        return {
+                          title:document.title,
+                          headings:[...document.querySelectorAll('h1,h2,h3')].map(e=>clean(e.textContent)),
+                          selects:[...document.querySelectorAll('select')].map(e=>({id:e.id,name:e.name,visible:vis(e),labels:[...(e.labels || [])].map(l=>clean(l.textContent)),options:[...e.options].map(o=>({label:clean(o.textContent),value:o.value,selected:o.selected}))})),
+                          inputs:[...document.querySelectorAll('input')].filter(e=>['checkbox','radio','date','text','button','submit','hidden'].includes(e.type)).map(e=>({id:e.id,name:e.name,type:e.type,visible:vis(e),labels:[...(e.labels || [])].map(l=>clean(l.textContent)),checked:e.checked})),
+                          forms:[...document.forms].map(f=>({id:f.id,name:f.name,method:f.method,action:new URL(f.action,location.href).pathname})),
+                          controls,
+                          scripts:[...document.scripts].filter(s=>s.src).map(s=>new URL(s.src).pathname)
+                        };
+                      }''')
+                      frames.append({'path':safe_url(frame.url), **data})
+                  except Error as exc:
+                      frames.append({'path':safe_url(frame.url),'error':type(exc).__name__})
+              report = {'stage':label, 'path':safe_url(page.url), 'frames':frames}
+              (out / (label+'.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('SHINAGAWA_FORM_BEGIN', label, flush=True)
+              print(json.dumps(report,ensure_ascii=False,indent=2),flush=True)
+              print('SHINAGAWA_FORM_END', label, flush=True)
+              try:
+                  page.screenshot(path=str(out / (label+'.png')),full_page=True,timeout=10000)
+              except Error as exc:
+                  print('SCREENSHOT_ERROR',type(exc).__name__,flush=True)
+
           with sync_playwright() as p:
               browser = p.chromium.launch()
-              page = browser.new_page(locale='ja-JP', timezone_id='Asia/Tokyo')
-              response = page.goto(URL, wait_until='domcontentloaded', timeout=30000)
-              page.get_by_text('空き状況検索', exact=False).first.wait_for(state='attached', timeout=15000)
-                  raise RuntimeError('公開ページ取得失敗')
-              data = page.evaluate('''() => {
-                const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-                const clean = s => (s || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
-                return {
-                  title: document.title,
-                  selects: [...document.querySelectorAll('select')].filter(visible).map(e => ({id:e.id,name:e.name,labels:[...e.labels||[]].map(l=>clean(l.textContent)),options:[...e.options].map(o=>({label:clean(o.textContent),value:o.value,selected:o.selected}))})),
-                  inputs: [...document.querySelectorAll('input')].filter(e=>visible(e)&&['checkbox','radio','date','text','button','submit'].includes(e.type)).map(e=>({id:e.id,name:e.name,type:e.type,labels:[...e.labels||[]].map(l=>clean(l.textContent)),checked:e.checked,placeholder:e.placeholder})),
-                  buttons: [...document.querySelectorAll('button,a,[role=button]')].filter(visible).map(e=>({id:e.id,text:clean(e.innerText),role:e.getAttribute('role')})).filter(e=>e.text && /検索|施設|目的|選択|条件|期間/.test(e.text)).slice(0,80),
-                  scripts:[...document.scripts].filter(s=>s.src).map(s=>new URL(s.src).pathname)
-                };
-              }''')
-              print('SHINAGAWA_FORM_BEGIN')
-              print(json.dumps(data, ensure_ascii=False, indent=2))
-              print('SHINAGAWA_FORM_END')
-              page.screenshot(path='shinagawa-home.png', full_page=True)
-              browser.close()
+              page = browser.new_page(locale='ja-JP', timezone_id='Asia/Tokyo',viewport={'width':1440,'height':1000})
+              responses = []
+              def observe(response):
+                  if response.request.resource_type in ('document','xhr','fetch') and len(responses)<100:
+                      if urlsplit(response.url).hostname == urlsplit(URL).hostname:
+                          responses.append({'method':response.request.method,'path':safe_url(response.url),'status':response.status})
+              page.on('response',observe)
+              try:
+                  response = page.goto(URL,wait_until='domcontentloaded',timeout=30000)
+                  print('HTTP_STATUS', response.status if response else 'NO_RESPONSE',flush=True)
+                  page.wait_for_timeout(1500)
+                  snapshot(page,'home')
+                  if response is None or response.status >= 400:
+                      raise RuntimeError('公開ページ取得失敗')
+                  # Only follow an unambiguous, visible public availability menu.
+                  candidates = []
+                  for frame in page.frames:
+                      for role in ('link','button'):
+                          for loc in frame.get_by_role(role,name='空き状況検索',exact=True).all():
+                              if loc.is_visible() and loc.is_enabled():
+                                  candidates.append(loc)
+                  print('VISIBLE_PUBLIC_SEARCH_CONTROLS',len(candidates),flush=True)
+                  if len(candidates) == 1:
+                      try:
+                          candidates[0].click(timeout=5000)
+                          page.wait_for_timeout(1500)
+                          snapshot(page,'search')
+                      except Error as exc:
+                          print('MENU_NAVIGATION_ERROR',type(exc).__name__,flush=True)
+                          snapshot(page,'after-menu-error')
+                  else:
+                      print('MENU_NOT_CLICKED: inspect home report',flush=True)
+              except Exception as exc:
+                  print('PROBE_ERROR',type(exc).__name__,flush=True)
+                  if not (out/'home.json').exists():
+                      snapshot(page,'error')
+                  raise
+              finally:
+                  print('SHINAGAWA_HTTP_BEGIN',flush=True)
+                  print(json.dumps(responses,ensure_ascii=False),flush=True)
+                  print('SHINAGAWA_HTTP_END',flush=True)
+                  browser.close()
           PY
-      - name: 公開画面の画像を保存
+      - name: 診断結果を保存（失敗時も実行）
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shinagawa-public-home
-          path: shinagawa-home.png
+          name: shinagawa-public-diagnostics
+          path: shinagawa-diagnostics/
+          if-no-files-found: warn
           retention-days: 2
