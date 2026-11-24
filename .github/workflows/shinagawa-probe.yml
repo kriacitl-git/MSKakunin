@@ -1,4 +1,4 @@
-name: 品川区施設検索・全地区検証 v10
+name: 品川区施設検索・全地区検証 v11
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 11
+    timeout-minutes: 14
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -39,18 +39,18 @@ jobs:
             echo "No system browser; installing headless shell only"
             python -m playwright install --only-shell chromium
           fi
-      - name: 全地区の公開空き検索（予約なし）
-        timeout-minutes: 9
+      - name: 全地区の公開API抽出・学校カレンダー診断（予約なし）
+        timeout-minutes: 12
         shell: bash
         run: |
-          timeout --signal=TERM --kill-after=5s 510s python -u - <<'PY'
+          timeout --signal=TERM --kill-after=5s 690s python -u - <<'PY'
           import json, os, re, calendar, time
           from pathlib import Path
           from datetime import date, datetime, timedelta, time as clock
           from zoneinfo import ZoneInfo
           from urllib.parse import urlsplit, parse_qs
           from playwright.sync_api import sync_playwright
-          
+
           URL='https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
           DISTRICTS={'荏原':'1100_0','大井':'1200_0','大崎':'1300_0','品川':'1400_0','八潮':'1500_0'}
           PURPOSE='31000000_31010300'
@@ -58,11 +58,11 @@ jobs:
           TIMES=('allday','morning','afternoon','evening')
           JST=ZoneInfo('Asia/Tokyo'); NOW=datetime.now(JST); TODAY=NOW.date()
           OUT=Path('shinagawa-results'); OUT.mkdir(exist_ok=True)
-          
+
           def shift(d,n):
               y,m=divmod(d.year*12+d.month-1+n,12)
               return date(y,m+1,min(d.day,calendar.monthrange(y,m+1)[1]))
-          
+
           def classify(building, room, d):
               if re.search(r'小学校|中学校|学園',building):
                   if d > shift(TODAY.replace(day=1),2)-timedelta(days=1): return None
@@ -77,49 +77,133 @@ jobs:
               # Public vacancy is not proof of account-specific eligibility.
               status='受付開始前' if NOW<opening else 'オンライン期限後・要確認' if TODAY>end else '受付期間内（資格要確認）'
               return {'種別':label,'予約状態':status,'受付開始':opening.isoformat()}
-          
-          def parse_rows(blocks, district, start, end, diagnostic=False):
+
+          def parse_date(value):
+              # Accept only unambiguous Gregorian date fields, not display text.
+              s=str(value).strip()
+              for fmt in ('%Y%m%d','%Y-%m-%d','%Y/%m/%d'):
+                  try: return datetime.strptime(s,fmt).date()
+                  except ValueError: pass
+              raise ValueError('unknown useYmd format: '+s[:30])
+
+          def minutes(value):
+              s=str(value).strip()
+              if re.fullmatch(r'\d{3,4}',s): h,m=divmod(int(s),100)
+              elif re.fullmatch(r'\d{1,2}:\d{2}(?::00)?',s): h,m=map(int,s.split(':')[:2])
+              elif re.fullmatch(r'\d{1,2}時\d{2}分',s): h,m=map(int,re.findall(r'\d+',s))
+              else: raise ValueError('unknown time format: '+s[:30])
+              if not (0<=m<60 and (0<=h<24 or h==24 and m==0)): raise ValueError('invalid time')
+              return h*60+m
+
+          def public_row(row):
+              keys=('bcd','icd','bcdNm','icdNm','useYmd','sTime','eTime','sJTime','eJTime','sJTime2','eJTime2','sTimeZones','eTimeZones','timeZoneNos','tZoneNo')
+              return {k:row.get(k) for k in keys if k in row}
+
+          def row_key(row):
+              return json.dumps([row.get(k) for k in ('bcd','icd','useYmd','sTime','eTime','timeZoneNos','tZoneNo')],ensure_ascii=False,sort_keys=True)
+
+          def parse_api(rows,district,start,end,diagnostic=False):
               slots=[]; errors=[]
-              for block in blocks:
+              for row in rows:
                   try:
-                      d=datetime.strptime(block['day'],'%Y%m%d').date()
+                      b=str(row.get('bcdNm') or '').strip(); r=str(row.get('icdNm') or '').strip()
+                      if not b or not r: raise ValueError('missing facility name')
+                      d=parse_date(row.get('useYmd'))
                       if not start<=d<=end or (not diagnostic and d.weekday()<5): raise ValueError('date outside query')
-                      for row in block['rows']:
-                          if len(row)!=4 or not row[0] or not row[1]: raise ValueError('unrecognized row structure')
-                          b,r,t,_=row
-                          matches=re.findall(r'(\d{1,2})時(\d{2})分\s*[～〜~－–-]\s*(\d{1,2})時(\d{2})分',t)
-                          if not matches: raise ValueError('unrecognized time')
-                          for h,m,h2,m2 in matches:
-                              a,z=int(h)*60+int(m),int(h2)*60+int(m2)
-                              if not 0<=a<z<=1440 or int(m)>59 or int(m2)>59: raise ValueError('invalid time')
-                              kind=classify(b,r,d)
-                              if kind is not None:
-                                  slots.append({'地区':district,'館':b,'施設':r,'日付':d.isoformat(),'開始':f'{int(h):02}:{m}','終了':f'{int(h2):02}:{m2}','分':z-a,**kind})
-                  except Exception as e: errors.append(str(e))
+                      a,z=minutes(row.get('sTime')),minutes(row.get('eTime'))
+                      if a>=z: raise ValueError('start >= end')
+                      # If structured subslots are provided, do not assume that gaps are bookable.
+                      # Inspect their shape; flag multi-segment rows for review instead of guessing.
+                      st,et=row.get('sTimeZones'),row.get('eTimeZones')
+                      if isinstance(st,list) and isinstance(et,list) and st and et:
+                          if len(st)!=len(et): raise ValueError('subslot count mismatch')
+                          ranges=[(minutes(x),minutes(y)) for x,y in zip(st,et)]
+                          if any(x>=y or x<a or y>z for x,y in ranges): raise ValueError('subslot range mismatch')
+                      else: ranges=[(a,z)]
+                      kind=classify(b,r,d) if not diagnostic else {'種別':'診断','予約状態':'通知対象外','受付開始':None}
+                      if kind is None: continue
+                      for x,y in ranges:
+                          slots.append({'地区':district,'館':b,'施設':r,'日付':d.isoformat(),'開始':f'{x//60:02}:{x%60:02}','終了':f'{y//60:02}:{y%60:02}','分':y-x,**kind})
+                  except Exception as e: errors.append({'error':str(e)[:200],'row':public_row(row)})
               return slots,errors
-          
-          # Build on the public date-order screen verified in v6. No login or booking.
-          EXTRACT=r'''() => {
+
+          def payload_shape(payload):
+              if not isinstance(payload,dict) or not isinstance(payload.get('results'),list): raise ValueError('unknown response shape')
+              total=int(payload['all']); hit=int(payload['hitcnt']); nxt=int(payload['next'])
+              if total<0 or hit!=len(payload['results']) or hit>total or nxt<0: raise ValueError('inconsistent result counters')
+              if any(not isinstance(x,dict) for x in payload['results']): raise ValueError('invalid result item')
+              return total,hit,nxt
+
+          def collect_pages(page,first):
+              from urllib.parse import parse_qsl,urlencode
+              req=first.request; url=req.url
+              if urlsplit(url).hostname!=urlsplit(URL).hostname or not urlsplit(url).path.endswith('/rsvWOpeUnreservedSearchAjaxAction.do') or req.method!='POST': raise RuntimeError('unexpected public search endpoint')
+              pairs=parse_qsl(req.post_data or '',keep_blank_values=True)
+              if len([k for k,v in pairs if k=='offset'])!=1: raise RuntimeError('offset missing or ambiguous')
+              headers={k:v for k,v in req.headers.items() if k.lower() in ('content-type','x-requested-with','accept','origin','referer')}
+              payload=first.json(); total,hit,nxt=payload_shape(payload)
+              if [v for k,v in pairs if k=='offset']!=['0']: raise RuntimeError('unexpected initial offset')
+              print('API_FIRST',json.dumps({'all':total,'hitcnt':hit,'next':nxt,'sample':[public_row(r) for r in payload['results'][:2]]},ensure_ascii=False),flush=True)
+              rows=list(payload['results']); keys={row_key(r) for r in rows}
+              pages=[{'offset':0,'all':total,'hitcnt':hit,'next':nxt}]
+              seen_offsets={0}
+              if len(keys)!=len(rows): raise RuntimeError('duplicate rows in first response')
+              # Follow the server-provided next cursor using the same public read-only POST.
+              # Reuse the browser context cookies internally, never log or persist them.
+              while len(rows)<total:
+                  if len(pages)>=30 or nxt<=0 or nxt in seen_offsets: raise RuntimeError('pagination cursor invalid or safety limit reached')
+                  offset=nxt; seen_offsets.add(offset)
+                  body=urlencode([(k,str(offset) if k=='offset' else v) for k,v in pairs])
+                  time.sleep(0.7)
+                  response=page.context.request.post(url,data=body,headers=headers,timeout=20000,max_redirects=0)
+                  try:
+                      if response.status!=200: raise RuntimeError('pagination HTTP '+str(response.status))
+                      payload=response.json(); t,h,nxt=payload_shape(payload)
+                      if t!=total or not h: raise RuntimeError('pagination count changed or empty page')
+                      new=payload['results']; new_keys={row_key(r) for r in new}
+                      if len(new_keys)!=len(new) or keys & new_keys: raise RuntimeError('pagination duplicates; cursor semantics require verification')
+                      rows.extend(new); keys.update(new_keys)
+                      pages.append({'offset':offset,'all':t,'hitcnt':h,'next':nxt})
+                      print('API_PAGE',json.dumps(pages[-1]),flush=True)
+                  finally: response.dispose()
+              if len(rows)!=total: raise RuntimeError('total row count mismatch')
+              return rows,pages
+
+          GRID=r'''() => {
+           const t=document.querySelector('#week-info');
            const clean=s=>(s||'').replace(/\s+/g,' ').trim();
-           const dates=[...document.querySelectorAll('a[id^="a_"]')].filter(a=>/^a_\d{8}$/.test(a.id));
-           const tables=[...document.querySelectorAll('table[id^="dt_free-info-"]')];
-           const blocks=[]; const errors=[];
-           for(const table of tables){
-             let a=null;
-             for(let p=table.parentElement;p && p!==document.body;p=p.parentElement){
-               const ds=[...p.querySelectorAll('a[id^="a_"]')].filter(e=>/^a_\d{8}$/.test(e.id));
-               if(ds.length===1){a=ds[0];break;}
-               if(ds.length>1)break;
-             }
-             if(!a && dates.length===1 && tables.length===1)a=dates[0];
-             if(!a){errors.push('date/table mapping unresolved');continue;}
-             const rows=[...table.rows].slice(1).map(r=>[...r.cells].map(c=>clean(c.innerText||c.textContent)));
-             blocks.push({day:a.id.slice(2),rows});
-           }
-           const controls=[...document.querySelectorAll('a,button')].filter(e=>e.getClientRects().length && !e.disabled).map(e=>clean(e.innerText));
-           return {blocks,errors,dates:dates.map(a=>a.id.slice(2)),tableCount:tables.length,body:clean(document.body.innerText).slice(0,1400),more:controls.filter(t=>/^(次へ|次のページ|もっと見る|さらに表示|続きを表示|次の\d+件)$/.test(t))};
+           return {building:clean(document.querySelector('#mansion-select')?.selectedOptions[0]?.textContent),room:clean(document.querySelector('#facility-select')?.selectedOptions[0]?.textContent),rows:t?[...t.rows].map(r=>[...r.cells].map(c=>({text:clean(c.innerText),icons:[...c.querySelectorAll('img')].map(i=>({alt:i.alt,title:i.title,file:new URL(i.src,location.href).pathname.split('/').pop()}))}))):[]};
           }'''
-          
+
+          def school_calendar(page,start,ready):
+              last=shift(start.replace(day=1),1)-timedelta(days=1)
+              expected={start+timedelta(days=i) for i in range((last-start).days+1) if (start+timedelta(days=i)).weekday()>=5}
+              dates={}; snapshots=[]
+              for _ in range(6):
+                  grid=page.evaluate(GRID); snapshots.append(grid)
+                  if grid['building']!='清水台小学校' or '土日祝' not in grid['room'] or len(grid['rows'])<2: raise RuntimeError('school calendar not verified')
+                  cols=grid['rows'][0][1:]
+                  for i,c in enumerate(cols,1):
+                      m=re.search(r'(\d+)月(\d+)日',c['text'])
+                      if not m: raise RuntimeError('unknown date header')
+                      month,day=map(int,m.groups()); year=start.year+(month<start.month)
+                      d=date(year,month,day)
+                      if d not in expected: continue
+                      if any(len(r)<=i for r in grid['rows'][1:]): raise RuntimeError('school calendar column missing')
+                      dates[d]={r[0]['text']:r[i]['icons'] for r in grid['rows'][1:]}
+                  if expected<=set(dates): break
+                  button=page.locator('#next-week')
+                  if not button.is_visible() or not button.is_enabled(): break
+                  before=grid['rows'][0]
+                  button.click(); ready()
+                  try:
+                      page.wait_for_function('(before) => JSON.stringify([...document.querySelectorAll("#week-info tr:first-child th, #week-info tr:first-child td")].map(c=>c.innerText.trim().replace(/\\s+/g," "))) !== JSON.stringify(before)',arg=[c['text'] for c in before],timeout=10000)
+                  except Exception: pass
+                  page.wait_for_timeout(800)
+                  if page.evaluate(GRID)['rows'][:1]==grid['rows'][:1]: break
+              missing=sorted(str(d) for d in expected-set(dates))
+              return {'館':'清水台小学校','対象月':start.strftime('%Y-%m'),'取得日数':len(dates),'予定日数':len(expected),'未取得日':missing,'日別状態':{str(d):v for d,v in sorted(dates.items())},'画面':snapshots}
+
           def scan(browser,district,code,start,control=False,diagnostic=False,time_mode="parts",calendar_only=False):
               end=start+timedelta(days=30)
               page=browser.new_page(locale='ja-JP',timezone_id='Asia/Tokyo',viewport={'width':1440,'height':1000})
@@ -188,35 +272,10 @@ jobs:
                   try: page.wait_for_load_state('networkidle',timeout=8000)
                   except Exception: pass
                   ready(); page.wait_for_timeout(1000)
-                  if control or calendar_only:
-                      # Facility calendar is independent of the date-order list.
-                      # Inspect only visible public status cells; never click booking.
-                      grid=page.evaluate(r'''() => {
-                        const t=document.querySelector('#week-info');
-                        const clean=s=>(s||'').replace(/\s+/g,' ').trim();
-                        return {building:document.querySelector('#mansion-select')?.selectedOptions[0]?.textContent||'',room:document.querySelector('#facility-select')?.selectedOptions[0]?.textContent||'',rooms:[...document.querySelectorAll('#facility-select option')].map(o=>clean(o.textContent)),rows:t?[...t.rows].map(r=>[...r.cells].map(c=>({text:clean(c.innerText),icons:[...c.querySelectorAll('img')].map(i=>({alt:i.alt,title:i.title,file:new URL(i.src,location.href).pathname.split('/').pop()}))}))):[]};
-                      }''')
-                      print('SCHOOL_CALENDAR',json.dumps(grid,ensure_ascii=False),flush=True)
                   if calendar_only:
-                      # This is a separate public calendar probe, even if daily search fails.
-                      if not grid or grid['building'].strip()!='清水台小学校' or not grid['rows']:
-                          raise RuntimeError('school calendar not verified')
-                      report={'館':grid['building'],'開始日':start.isoformat(),'時間帯方式':time_mode,'週表示':grid}
-                      (OUT/'school-calendar.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-                      month=page.get_by_role('button',name='月表示',exact=True)
-                      try:
-                          if month.count()!=1 or not month.is_visible(): raise RuntimeError('month view not available')
-                          with page.expect_response(lambda r: urlsplit(r.url).path.endswith('/rsvWOpeInstSrchVacantAjaxAction.do'),timeout=15000) as m:
-                              month.click()
-                          if m.value.status!=200: raise RuntimeError('month HTTP failure')
-                          m.value.body(); ready(); page.wait_for_timeout(700)
-                          report['月表示']=page.evaluate(r'''() => {
-                            const clean=s=>(s||'').replace(/\s+/g,' ').trim();
-                            return {text:clean(document.body.innerText).slice(0,2500),tables:[...document.querySelectorAll('table')].filter(t=>t.getClientRects().length).map(t=>({id:t.id,rows:[...t.rows].map(r=>[...r.cells].map(c=>({text:clean(c.innerText),icons:[...c.querySelectorAll('img')].map(i=>({alt:i.alt,title:i.title,file:new URL(i.src,location.href).pathname.split('/').pop()}))})))}))};
-                          }''')
-                      except Exception as e: report['月表示エラー']=str(e)[:300]
-                      (OUT/'school-calendar.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-                      print('SCHOOL_INDEPENDENT',json.dumps(report,ensure_ascii=False),flush=True)
+                      report=school_calendar(page,start,ready)
+                      (OUT/f'school-{start}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print('SCHOOL_INDEPENDENT',json.dumps({k:v for k,v in report.items() if k!='画面'},ensure_ascii=False),flush=True)
                       return report
                   tab=page.get_by_role('link',name='日付順',exact=True); tab.wait_for(state='visible')
                   with page.expect_response(lambda r:'rsvWOpeUnreservedSearchAjaxAction.do' in urlsplit(r.url).path,timeout=25000) as wait:
@@ -226,51 +285,29 @@ jobs:
                   try: page.wait_for_load_state('networkidle',timeout=8000)
                   except Exception: pass
                   ready(); page.wait_for_timeout(1200)
-                  # Expand only the public results, never a reservation control.
-                  expand=page.get_by_role('button',name='すべて開く',exact=True)
-                  if expand.count()==1 and expand.is_visible(): expand.click(); ready()
-                  # Trigger bounded lazy loading through normal scrolling; do not forge requests.
-                  for _ in range(5):
-                      before=page.locator('table[id^="dt_free-info-"]').count()
-                      page.evaluate('window.scrollTo(0,document.body.scrollHeight)'); page.wait_for_timeout(650); ready()
-                      if page.locator('table[id^="dt_free-info-"]').count()==before: break
-                  data=page.evaluate(EXTRACT)
-                  meta=[]
-                  for response in responses:
-                      try:
-                          payload=response.json()
-                          if isinstance(payload,dict):
-                              meta.append({'keys':list(payload)[:50], 'counts':{k:v for k,v in payload.items() if k in ('all','next','hitcnt','total','count','limit','offset','size') and (v is None or isinstance(v,(bool,int,float)) or isinstance(v,str) and len(v)<=40)},'lists':{k:len(v) for k,v in payload.items() if isinstance(v,list)},'result_shape':list(payload['results'][0].keys()) if isinstance(payload.get('results'),list) and payload['results'] and isinstance(payload['results'][0],dict) else []})
-                          elif isinstance(payload,list): meta.append({'list_length':len(payload)})
-                      except Exception: meta.append({'format':'non-json'})
-                  slots,errors=parse_rows(data['blocks'],district,start,end,diagnostic)
-                  errors+=data['errors']
+                  rows,pages=collect_pages(page,wait.value)
+                  slots,errors=parse_api(rows,district,start,end,diagnostic)
+                  body=page.locator('body').inner_text()
                   expected=f'{start.year}年{start.month}月{start.day}日'
                   target_label='清水台小学校' if control else district+'地区'
                   daily=[r['条件'] for r in requests if r['path']=='rsvWOpeUnreservedSearchAjaxAction.do']
-                  # All-time values may be encoded using a different name; fail closed until verified.
-                  if not daily or any(set(q.get('timezone',[]))!={time_controls[n] for n in expected_times} for q in daily):
-                      errors.append('selected time categories not verified in date-order request')
-                  if expected not in data['body'] or (not diagnostic and '土日曜' not in data['body']) or '1か月表示' not in data['body'] or target_label not in data['body'] or 'バレーボール' not in data['body']:
+                  wanted_days={str(i+1) for i,n in enumerate(DAYS[:7]) if n in target_days} | ({'9'} if 'holiday' in target_days else set())
+                  expected_values={time_controls[n] for n in expected_times}
+                  if not daily or any(set(q.get('timezone',[]))!=expected_values or set(q.get('dayofweek',[]))!=wanted_days or q.get('daystart')!=[start.isoformat()] or q.get('days')!=['31'] or q.get('selectAreaBcd')!=[code] or q.get('selectPpsClPpscd')!=[PURPOSE] for q in daily):
+                      errors.append('request condition mismatch')
+                  if expected not in body or (not diagnostic and '土日曜' not in body) or '1か月表示' not in body or target_label not in body or 'バレーボール' not in body:
                       errors.append('server search condition echo not verified')
-                  if set(data['dates'])!=set(b['day'] for b in data['blocks']): errors.append('date sections not fully mapped')
-                  if data['more']: errors.append('pagination control present')
-                  empty_text='指定条件に該当する空き施設が見つかりませんでした' in data['body']
-                  empty_json=bool(meta) and all(m.get('lists',{}).get('results')==0 for m in meta)
-                  empty_count=bool(meta) and all(str(m.get('counts',{}).get('hitcnt','')).strip()=='0' for m in meta)
-                  empty_ok=not data['blocks'] and empty_text and empty_json and empty_count and bool(calls) and all(c['status']==200 for c in calls)
-                  if not data['blocks'] and not empty_ok: errors.append('empty result not independently confirmed')
-                  if data['blocks'] and empty_text: errors.append('conflicting empty message and result tables')
-                  # Until pagination metadata is independently verified, report observed slots only.
-                  report={'地区':district,'開始日':start.isoformat(),'終了日':end.isoformat(),'空き枠':slots,'注意':errors,'通信':calls,'送信条件':requests,'応答概要':meta,'日付見出し':data['dates'],'表数':data['tableCount'],'表示抜粋':data['body'],'網羅性':'要検証' if errors or not empty_ok else '日付順の0件応答を確認','対照検索':control,'陽性診断':diagnostic,'学校カレンダー':grid,'時間帯方式':time_mode}
-                  (OUT/f'{code}-{start}-{time_mode}{"-positive" if diagnostic else ""}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                  empty_text='指定条件に該当する空き施設が見つかりませんでした' in body
+                  if (not rows)!=empty_text: errors.append('API / page empty indication mismatch')
+                  report={'地区':district,'開始日':start.isoformat(),'終了日':end.isoformat(),'空き枠':slots,'注意':errors,'通信':calls,'送信条件':requests,'ページ':pages,'API件数':len(rows),'API抜粋':[public_row(r) for r in rows[:3]],'網羅性':'要検証' if errors else 'API件数一致','対照検索':control,'陽性診断':diagnostic,'時間帯方式':time_mode}
+                  (OUT/f'{code}-{start}-{time_mode}{"-positive" if diagnostic else ""}.json').write_text(json.dumps({**report,'API全公開項目':[public_row(r) for r in rows]},ensure_ascii=False,indent=2),encoding='utf-8')
                   print('DISTRICT_RESULT',json.dumps(report,ensure_ascii=False),flush=True)
                   return report
               finally:
                   page.remove_listener('request',observe_request)
                   page.remove_listener('response',observe)
                   page.close()
-          
+
           # 31-day chunks: cover both the next calendar month and the two-month horizon.
           horizon=max(shift(TODAY,2),shift(TODAY.replace(day=1),2)-timedelta(days=1))
           starts=[]; d=TODAY
@@ -280,6 +317,12 @@ jobs:
               chrome=os.environ.get('SHINAGAWA_CHROME')
               browser=p.chromium.launch(**({'executable_path':chrome} if chrome else {}),timeout=15000)
               try:
+                  positive={'実施':True}
+                  try:
+                      pr=scan(browser,'荏原','1100_0',TODAY,diagnostic=True)
+                      positive={'実施':True,'取得枠数':len(pr['空き枠']),'API件数':pr['API件数'],'ページ':pr['ページ'],'注意':pr['注意']}
+                  except Exception as e: positive={'実施':True,'エラー':str(e)[:400]}
+                  print('POSITIVE_CONTROL',json.dumps(positive,ensure_ascii=False),flush=True)
                   for start in starts:
                       for district,code in DISTRICTS.items():
                           try: reports.append(scan(browser,district,code,start))
@@ -318,16 +361,6 @@ jobs:
                       comparison={'一致':match,'地区検索枠':len(area_keys),'施設単独検索枠':len(control_keys),'注意':'両方0件の場合は抽出の陽性検証にはならない'}
                   except Exception as e:
                       comparison={'一致':False,'エラー':str(e)[:400]}
-                  # A non-weekend control is for validation only; exclude it from all results and LINE.
-                  # Run only if the main weekend searches have no extracted rows.
-                  positive={'実施':False}
-                  if not any(r.get('空き枠') for r in reports):
-                      try:
-                          pr=scan(browser,'荏原','1100_0',TODAY,diagnostic=True)
-                          positive={'実施':True,'取得枠数':len(pr.get('空き枠',[])),'注意':pr.get('注意',[]),'応答概要':pr.get('応答概要',[])}
-                      except Exception as e:
-                          positive={'実施':True,'エラー':str(e)[:400]}
-                  print('POSITIVE_CONTROL',json.dumps(positive,ensure_ascii=False),flush=True)
                   print('CONTROL_COMPARISON',json.dumps(comparison,ensure_ascii=False),flush=True)
                   (OUT/'control-comparison.json').write_text(json.dumps(comparison,ensure_ascii=False,indent=2),encoding='utf-8')
               finally: browser.close()
@@ -336,12 +369,12 @@ jobs:
               for s in r['空き枠']:
                   if TODAY<=date.fromisoformat(s['日付'])<=horizon:
                       slots[tuple(s[k] for k in ('館','施設','日付','開始','終了'))]=s
-          result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS),'検索結果':reports,'対照結果':comparison,'陽性診断':positive,'時間帯比較':mode_comparison,'学校独立診断':{'取得':bool(school_probe.get('週表示')),'月表示取得':bool(school_probe.get('月表示')),'エラー':school_probe.get('エラー',school_probe.get('月表示エラー'))},'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'網羅性':'検証中（空きなしの断定禁止）'}
+          result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS),'検索結果':reports,'対照結果':comparison,'陽性診断':positive,'時間帯比較':mode_comparison,'学校独立診断':{'取得':bool(school_probe.get('日別状態')),'対象月':school_probe.get('対象月'),'取得日数':school_probe.get('取得日数'),'予定日数':school_probe.get('予定日数'),'未取得日':school_probe.get('未取得日'),'エラー':school_probe.get('エラー')},'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'網羅性':'検証中（空きなしの断定禁止）'}
           # Separate business rules and outputs without doubling district traffic.
           result['学校枠']=[s for s in result['取得枠'] if s['種別']=='学校']
           result['学校以外枠']=[s for s in result['取得枠'] if s['種別']!='学校']
           result['学校受付開始前']=[s for s in result['学校枠'] if s['予約状態']=='受付開始前']
-          result['学校事前候補の網羅性']='清水台小学校のみ独立診断・全校巡回は未検証'
+          result['学校事前候補の網羅性']='清水台小学校のみ独立診断・受付開始前と全校巡回は未検証'
           (OUT/'schools.json').write_text(json.dumps(result['学校枠'],ensure_ascii=False,indent=2),encoding='utf-8')
           (OUT/'other-facilities.json').write_text(json.dumps(result['学校以外枠'],ensure_ascii=False,indent=2),encoding='utf-8')
           (OUT/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -351,7 +384,7 @@ jobs:
           for r in reports:
               if r.get('エラー') or r.get('注意'): lines.append(f"- 要確認: {r['地区']} {r['開始日']} {r.get('エラー',r.get('注意'))}")
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f: f.write('\n'.join(lines)+'\n')
-          if not comparison.get('一致') or not mode_comparison.get('一致') or not school_probe.get('月表示') or any(r.get('エラー') or r.get('注意') for r in reports): raise SystemExit('Partial or ambiguous results: inspect report')
+          if not comparison.get('一致') or not mode_comparison.get('一致') or not school_probe.get('日別状態') or school_probe.get('未取得日') or positive.get('エラー') or positive.get('注意') or not positive.get('API件数') or any(r.get('エラー') or r.get('注意') for r in reports): raise SystemExit('Partial or ambiguous results: inspect report')
           PY
       - name: 検証結果を保存
         if: always()
