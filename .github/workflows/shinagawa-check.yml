@@ -328,9 +328,8 @@ jobs:
                 for start in starts:
                     for district,code in DISTRICTS.items():
                         try:
-                            # The two mutually exclusive modes are not proven equivalent on positive data.
-                            # Union both results; do not silently omit the full-day category.
-                            for mode in ('parts','allday'):
+                            # Daily audit compares the two time modes.
+                            for mode in ('parts',):
                                 try: reports.append(scan(browser,district,code,start,time_mode=mode))
                                 except Exception as e:
                                     r={'地区':district,'開始日':start.isoformat(),'時間帯方式':mode,'エラー':str(e)[:400],'空き枠':[]}
@@ -352,7 +351,7 @@ jobs:
                 if TODAY<=date.fromisoformat(s['日付'])<=horizon:
                     slots[tuple(s[k] for k in ('地区','館','施設','日付','開始','終了'))]=s
         failed=[r for r in reports if r.get('エラー') or r.get('注意')]
-        result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS)*2,'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'検索結果':reports,'診断':diagnostics,'失敗検索数':len(failed),'網羅性':'API件数照合済み'}
+        result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS),'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'検索結果':reports,'診断':diagnostics,'失敗検索数':len(failed),'網羅性':'API件数照合済み'}
         result['学校枠']=[s for s in result['取得枠'] if s['種別']=='学校']
         result['学校以外枠']=[s for s in result['取得枠'] if s['種別']!='学校']
         (OUT/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')

@@ -13,14 +13,25 @@ name: 品川区・学校月間カレンダー
         - 大崎
         - 品川
         - 八潮
+      mode:
+        description: 学校処理モード
+        type: choice
+        default: calendar
+        options:
+        - calendar
+        - candidate_preview
+        - candidate_notify
+      target_month:
+        description: 候補プレビュー対象月（YYYY-MM、空欄は翌月）
+        type: string
+        required: false
   schedule:
   - cron: 17 21 14-18 * *
   - cron: 45 22 19 * *
+  - cron: 0 12 19 * *
+  - cron: 50 23 19 * *
 permissions:
   contents: read
-concurrency:
-  group: shinagawa-school-check
-  cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-24.04
@@ -439,4 +450,398 @@ jobs:
         path: shinagawa-results/
         if-no-files-found: warn
         retention-days: 2
-    if: github.event_name == 'workflow_dispatch' || vars.SHINAGAWA_SCHOOL_ENABLED == 'true'
+    if: (github.event_name == 'workflow_dispatch' && inputs.mode == 'calendar') || (github.event_name == 'schedule' && vars.SHINAGAWA_SCHOOL_ENABLED == 'true' && (github.event.schedule
+      == '17 21 14-18 * *' || github.event.schedule == '45 22 19 * *'))
+    concurrency:
+      group: shinagawa-school-calendar
+      cancel-in-progress: false
+  candidates:
+    if: (github.event_name == 'workflow_dispatch' && (inputs.mode == 'candidate_preview' || inputs.mode == 'candidate_notify')) || (github.event_name == 'schedule' && vars.SHINAGAWA_MONTHLY_NOTIFY_ENABLED
+      == 'true' && (github.event.schedule == '0 12 19 * *' || github.event.schedule == '50 23 19 * *'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    concurrency:
+      group: shinagawa-school-candidates
+      cancel-in-progress: false
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: ブラウザ準備
+      timeout-minutes: 2
+      shell: bash
+      run: |
+        python -m pip install --disable-pip-version-check 'playwright==1.56.0'
+        CHROME=""
+        for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+          if command -v "$candidate" >/dev/null 2>&1; then
+            CHROME="$(command -v "$candidate")"
+            break
+          fi
+        done
+        if [ -n "$CHROME" ]; then
+          "$CHROME" --version
+          echo "SHINAGAWA_CHROME=$CHROME" >> "$GITHUB_ENV"
+          echo "Using preinstalled browser"
+        else
+          echo "No system browser; installing headless shell only"
+          python -m playwright install --only-shell chromium
+        fi
+    - name: 翌月の学校公開API候補抽出
+      timeout-minutes: 10
+      env:
+        CANDIDATE_MONTH: ${{ inputs.mode == 'candidate_preview' && inputs.target_month || '' }}
+      shell: bash
+      run: |
+        timeout --signal=TERM --kill-after=5s 540s python -u - <<'PY'
+        import json, os, re, calendar, time
+        from pathlib import Path
+        from datetime import date, datetime, timedelta, time as clock
+        from zoneinfo import ZoneInfo
+        from urllib.parse import urlsplit, parse_qs
+        from playwright.sync_api import sync_playwright
+
+        URL='https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
+        DISTRICTS={'荏原':'1100_0','大井':'1200_0','大崎':'1300_0','品川':'1400_0','八潮':'1500_0'}
+        PURPOSE='31000000_31010300'
+        DAYS=('monday','tuesday','wednesday','thursday','friday','saturday','sunday','holiday')
+        TIMES=('allday','morning','afternoon','evening')
+        JST=ZoneInfo('Asia/Tokyo'); NOW=datetime.now(JST); TODAY=NOW.date()
+        OUT=Path('shinagawa-results'); OUT.mkdir(exist_ok=True)
+
+        def shift(d,n):
+            y,m=divmod(d.year*12+d.month-1+n,12)
+            return date(y,m+1,min(d.day,calendar.monthrange(y,m+1)[1]))
+
+        def candidate_month():
+            v=os.environ.get('CANDIDATE_MONTH','').strip()
+            target=shift(TODAY.replace(day=1),1)
+            if not v: return target
+            if not re.fullmatch(r'\d{4}-\d{2}',v): raise ValueError('invalid target month')
+            d=date.fromisoformat(v+'-01')
+            if d not in (target,shift(target,1)): raise ValueError('target month outside preview range')
+            return d
+
+        def classify(building, room, d):
+            target=candidate_month()
+            if not re.search(r'小学校|中学校|学園',building) or d.replace(day=1)!=target: return None
+            opening=datetime.combine(shift(target.replace(day=20),-1),clock(9),JST)
+            return {'種別':'学校','予約状態':'公開API候補・予約可否未確定','受付開始':opening.isoformat()}
+
+        def parse_date(value):
+            # Accept only unambiguous Gregorian date fields, not display text.
+            s=str(value).strip()
+            for fmt in ('%Y%m%d','%Y-%m-%d','%Y/%m/%d'):
+                try: return datetime.strptime(s,fmt).date()
+                except ValueError: pass
+            raise ValueError('unknown useYmd format: '+s[:30])
+
+        def minutes(value):
+            s=str(value).strip()
+            if re.fullmatch(r'\d{3,4}',s): h,m=divmod(int(s),100)
+            elif re.fullmatch(r'\d{1,2}:\d{2}(?::00)?',s): h,m=map(int,s.split(':')[:2])
+            elif re.fullmatch(r'\d{1,2}時\d{2}分',s): h,m=map(int,re.findall(r'\d+',s))
+            else: raise ValueError('unknown time format: '+s[:30])
+            if not (0<=m<60 and (0<=h<24 or h==24 and m==0)): raise ValueError('invalid time')
+            return h*60+m
+
+        def public_row(row):
+            keys=('bcd','icd','bcdNm','icdNm','useYmd','sTime','eTime','sJTime','eJTime','sJTime2','eJTime2','sTimeZones','eTimeZones','timeZoneNos','tZoneNo')
+            return {k:row.get(k) for k in keys if k in row}
+
+        def row_key(row):
+            return json.dumps([row.get(k) for k in ('bcd','icd','useYmd','sTime','eTime','timeZoneNos','tZoneNo')],ensure_ascii=False,sort_keys=True)
+
+        def parse_api(rows,district,start,end,diagnostic=False):
+            slots=[]; errors=[]
+            for row in rows:
+                try:
+                    b=str(row.get('bcdNm') or '').strip(); r=str(row.get('icdNm') or '').strip()
+                    if not b or not r: raise ValueError('missing facility name')
+                    d=parse_date(row.get('useYmd'))
+                    if not start<=d<=end or (not diagnostic and d.weekday()<5): raise ValueError('date outside query')
+                    a,z=minutes(row.get('sTime')),minutes(row.get('eTime'))
+                    if a>=z: raise ValueError('start >= end')
+                    # If structured subslots are provided, do not assume that gaps are bookable.
+                    # Inspect their shape; flag multi-segment rows for review instead of guessing.
+                    st,et=row.get('sTimeZones'),row.get('eTimeZones')
+                    if isinstance(st,str) and st: st=st.split('|')
+                    if isinstance(et,str) and et: et=et.split('|')
+                    if bool(st)!=bool(et): raise ValueError('incomplete subslot data')
+                    if isinstance(st,list) and isinstance(et,list) and st and et:
+                        if len(st)!=len(et): raise ValueError('subslot count mismatch')
+                        ranges=[(minutes(x),minutes(y)) for x,y in zip(st,et)]
+                        if any(x>=y or x<a or y>z for x,y in ranges): raise ValueError('subslot range mismatch')
+                        if ranges!=sorted(ranges) or any(ranges[i][1]>ranges[i+1][0] for i in range(len(ranges)-1)): raise ValueError('overlapping or unordered subslots')
+                    else: ranges=[(a,z)]
+                    kind=classify(b,r,d) if not diagnostic else {'種別':'診断','予約状態':'通知対象外','受付開始':None}
+                    if kind is None: continue
+                    for x,y in ranges:
+                        slots.append({'地区':district,'館':b,'施設':r,'日付':d.isoformat(),'開始':f'{x//60:02}:{x%60:02}','終了':f'{y//60:02}:{y%60:02}','分':y-x,**kind})
+                except Exception as e: errors.append({'error':str(e)[:200],'row':public_row(row)})
+            return slots,errors
+
+        def payload_shape(payload):
+            if not isinstance(payload,dict) or not isinstance(payload.get('results'),list): raise ValueError('unknown response shape')
+            total=int(payload['all']); hit=int(payload['hitcnt']); nxt=int(payload['next'])
+            if total<0 or hit!=len(payload['results']) or hit>total or nxt<0: raise ValueError('inconsistent result counters')
+            if any(not isinstance(x,dict) for x in payload['results']): raise ValueError('invalid result item')
+            return total,hit,nxt
+
+        def replace_offset(raw,offset):
+            if len(re.findall(rb'(?:^|&)offset=[^&]*',raw))!=1: raise RuntimeError('offset missing or ambiguous')
+            return re.sub(rb'(^|&)offset=[^&]*',lambda m:m.group(1)+b'offset='+str(offset).encode('ascii'),raw)
+
+        def decode_payload(raw,content_type=''):
+            # Decode strictly; an HTML error page must never count as zero vacancies.
+            declared=re.search(r'charset\s*=\s*["\']?([a-zA-Z0-9_-]+)',content_type,re.I)
+            encodings=['utf-8-sig']+([declared.group(1)] if declared else [])+['cp932','shift_jis','euc_jp']
+            for encoding in dict.fromkeys(encodings):
+                try:
+                    payload=json.loads(raw.decode(encoding))
+                    payload_shape(payload)
+                    return payload,encoding
+                except (UnicodeError,LookupError,ValueError,KeyError,TypeError): pass
+            raise RuntimeError('pagination response is not valid JSON with known counters; content-type='+content_type[:100])
+
+        def request_params(req):
+            # ASCII form keys and values are all that are logged. Preserve non-ASCII bytes internally.
+            return parse_qs((req.post_data_buffer or b'').decode('latin-1'),keep_blank_values=True,encoding='latin-1')
+
+        def collect_pages(page,first):
+            req=first.request; url=req.url
+            if urlsplit(url).hostname!=urlsplit(URL).hostname or not urlsplit(url).path.endswith('/rsvWOpeUnreservedSearchAjaxAction.do') or req.method!='POST': raise RuntimeError('unexpected public search endpoint')
+            raw=req.post_data_buffer or b''
+            if not raw: raise RuntimeError('missing original request body')
+            if len(re.findall(rb'(?:^|&)offset=[^&]*',raw))!=1: raise RuntimeError('offset missing or ambiguous')
+            headers={k:v for k,v in req.headers.items() if k.lower() in ('content-type','x-requested-with','accept','origin','referer')}
+            payload,encoding=decode_payload(first.body(),first.headers.get('content-type','')); total,hit,nxt=payload_shape(payload)
+            if not re.search(rb'(?:^|&)offset=0(?:&|$)',raw): raise RuntimeError('unexpected initial offset')
+            print('API_FIRST',json.dumps({'all':total,'hitcnt':hit,'next':nxt,'sample':[public_row(r) for r in payload['results'][:2]]},ensure_ascii=False),flush=True)
+            rows=list(payload['results']); keys={row_key(r) for r in rows}
+            pages=[{'offset':0,'all':total,'hitcnt':hit,'next':nxt,'encoding':encoding}]
+            seen_offsets={0}
+            if len(keys)!=len(rows): raise RuntimeError('duplicate rows in first response')
+            # Try a bounded larger page on the identical public search. Do not accept
+            # a partial result, changed count, or a response missing initial rows.
+            if len(rows)<total:
+                if total>200: raise RuntimeError('result exceeds bounded page size; split search period')
+                if len(re.findall(rb'(?:^|&)limit=[^&]*',raw))!=1: raise RuntimeError('limit missing or ambiguous')
+                body=re.sub(rb'(^|&)limit=[^&]*',lambda m:m.group(1)+b'limit='+str(min(200,max(20,total))).encode('ascii'),raw)
+                time.sleep(1)
+                response=page.context.request.post(url,data=body,headers=headers,timeout=20000,max_redirects=0)
+                try:
+                    if response.status!=200: raise RuntimeError('expanded page HTTP '+str(response.status))
+                    data,enc=decode_payload(response.body(),response.headers.get('content-type',''))
+                    t,h,n=payload_shape(data); new=data['results']; new_keys={row_key(r) for r in new}
+                    evidence={'offset':0,'limit':min(200,max(20,total)),'all':t,'hitcnt':h,'next':n,'encoding':enc,'unique':len(new_keys),'contains_first':keys<=new_keys}
+                    print('API_EXPANDED',json.dumps(evidence),flush=True)
+                    if t!=total or h!=total or len(new_keys)!=total or not keys<=new_keys:
+                        raise RuntimeError('expanded page incomplete; use native pagination or shorter periods after inspection')
+                    rows=new; pages.append(evidence)
+                finally: response.dispose()
+            if len(rows)!=total: raise RuntimeError('total row count mismatch')
+            return rows,pages
+
+        GRID=r'''() => {
+         const t=document.querySelector('#week-info');
+         const clean=s=>(s||'').replace(/\s+/g,' ').trim();
+         return {building:clean(document.querySelector('#mansion-select')?.selectedOptions[0]?.textContent),room:clean(document.querySelector('#facility-select')?.selectedOptions[0]?.textContent),rooms:[...document.querySelectorAll('#facility-select option')].map(o=>clean(o.textContent)),rows:t?[...t.rows].map(r=>[...r.cells].map(c=>({text:clean(c.innerText),icons:[...c.querySelectorAll('img')].map(i=>({alt:i.alt,title:i.title,file:new URL(i.src,location.href).pathname.split('/').pop()}))}))):[]};
+        }'''
+
+        def scan(browser,district,code,start,control=False,diagnostic=False,time_mode="parts",calendar_only=False,school_name=None):
+            end=start+timedelta(days=30)
+            page=browser.new_page(locale='ja-JP',timezone_id='Asia/Tokyo',viewport={'width':1440,'height':1000})
+            page.set_default_timeout(10000)
+            calls=[]; responses=[]; requests=[]; grid=None
+            def observe_request(req):
+                path=urlsplit(req.url).path
+                if not path.endswith(('rsvWOpeInstSrchVacantAction.do','rsvWOpeUnreservedDailyAction.do','rsvWOpeUnreservedSearchAjaxAction.do')): return
+                q=request_params(req)
+                # Only public search parameters; no cookies, session IDs or credentials.
+                safe=('date','daystart','days','dayofweek','dayofweekClearFlg','timezone','timezoneClearFlg','selectAreaBcd','selectIcd','selectPpsClPpscd','offset','limit')
+                requests.append({'path':path.rsplit('/',1)[-1],'条件':{k:q[k] for k in safe if k in q}})
+            page.on('request',observe_request)
+            def observe(r):
+                if 'rsvWOpeUnreservedSearchAjaxAction.do' in urlsplit(r.url).path:
+                    q=request_params(r.request)
+                    calls.append({'status':r.status,'offset':q.get('offset',[]),'limit':q.get('limit',[])})
+                    responses.append(r)
+            page.on('response',observe)
+            try:
+                res=page.goto(URL,wait_until='domcontentloaded',timeout=20000)
+                if not res or res.status!=200: raise RuntimeError('home HTTP failure')
+                def ready(): page.locator('#loadmsg').wait_for(state='hidden',timeout=12000)
+                def checked(name):
+                    target=page.locator('#'+name)
+                    if not target.is_checked():
+                        ready(); page.locator('label[for="'+name+'"]').click(); ready()
+                    if not target.is_checked(): raise RuntimeError('checkbox not selected: '+name)
+                page.locator('#bname').wait_for(state='visible'); ready(); checked('thismonth')
+                page.locator('#bname').select_option(value=code); ready()
+                page.locator('#purpose').select_option(value=PURPOSE); ready()
+                if not page.locator('#saturday').is_visible(): page.locator('#collapse-when').click(); ready()
+                if page.locator('#days').is_visible(): page.locator('#days').select_option('31'); ready()
+                if start!=TODAY:
+                    day=page.locator('#daystart')
+                    if not day.is_visible(): raise RuntimeError('custom start unavailable')
+                    day.fill(start.isoformat()); day.press('Tab'); ready()
+                target_days=list(DAYS) if diagnostic else ['saturday','sunday']
+                for name in DAYS:
+                    target=page.locator('#'+name)
+                    if target.is_checked() != (name in target_days):
+                        ready(); page.locator('label[for="'+name+'"]').click(); ready()
+                # v8 sent no timezone values to the daily endpoint. Explicitly
+                # select every published time category, including full-day slots.
+                expected_times = ['allday'] if time_mode=='allday' else ['morning','afternoon','evening']
+                for name in expected_times:
+                    checked(name)
+                for name in TIMES:
+                    if name not in expected_times and page.locator('#'+name).is_checked():
+                        ready(); page.locator('label[for="'+name+'"]').click(); ready()
+                time_controls={name:page.locator('#'+name).input_value() for name in TIMES}
+                time_selected=[name for name in TIMES if page.locator('#'+name).is_checked()]
+                print('TIME_SELECTION',json.dumps({'地区':district,'開始日':start.isoformat(),'選択':time_selected,'値':time_controls,'診断':diagnostic,'時間帯方式':time_mode},ensure_ascii=False),flush=True)
+                if set(time_selected)!=set(expected_times): raise RuntimeError('time mode mismatch: '+time_mode)
+                actual=page.locator('#daystart').input_value()
+                chosen=[n for n in DAYS if page.locator('#'+n).is_checked()]
+                if (actual!=start.isoformat() or page.locator('#days').input_value()!='31' or chosen!=target_days or page.locator('#bname').input_value()!=code or page.locator('#purpose').input_value()!=PURPOSE):
+                    raise RuntimeError('condition mismatch: '+str({'date':actual,'days':page.locator('#days').input_value(),'weekdays':chosen}))
+                print('SEARCH',district,start,flush=True)
+                # Match the successful v6 sequence: wait for initial facility AJAX,
+                # not just disappearance of the overlay, before switching views.
+                with page.expect_response(lambda r: urlsplit(r.url).path.endswith('/rsvWOpeInstSrchVacantAjaxAction.do'),timeout=25000) as first:
+                    page.locator('#btn-go').click()
+                if first.value.status!=200: raise RuntimeError('facility search HTTP failure')
+                first.value.body()
+                try: page.wait_for_load_state('networkidle',timeout=8000)
+                except Exception: pass
+                ready(); page.wait_for_timeout(1000)
+                if calendar_only:
+                    report=school_calendar(page,start,ready,school_name or '清水台小学校')
+                    (OUT/f'school-{code}-{start}.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                    print('SCHOOL_INDEPENDENT',json.dumps({k:v for k,v in report.items() if k not in ('画面','日別状態')},ensure_ascii=False),flush=True)
+                    return report
+                tab=page.get_by_role('link',name='日付順',exact=True); tab.wait_for(state='visible')
+                with page.expect_response(lambda r:'rsvWOpeUnreservedSearchAjaxAction.do' in urlsplit(r.url).path,timeout=25000) as wait:
+                    tab.click()
+                if wait.value.status!=200: raise RuntimeError('date-order HTTP failure')
+                wait.value.body()
+                try: page.wait_for_load_state('networkidle',timeout=8000)
+                except Exception: pass
+                ready(); page.wait_for_timeout(1200)
+                rows,pages=collect_pages(page,wait.value)
+                slots,errors=parse_api(rows,district,start,end,diagnostic)
+                body=page.locator('body').inner_text()
+                expected=f'{start.year}年{start.month}月{start.day}日'
+                target_label='清水台小学校' if control else district+'地区'
+                daily=[r['条件'] for r in requests if r['path']=='rsvWOpeUnreservedSearchAjaxAction.do']
+                wanted_days={str(i+1) for i,n in enumerate(DAYS[:7]) if n in target_days} | ({'9'} if 'holiday' in target_days else set())
+                expected_values={time_controls[n] for n in expected_times}
+                if not daily or any(set(q.get('timezone',[]))!=expected_values or set(q.get('dayofweek',[]))!=wanted_days or q.get('daystart')!=[start.isoformat()] or q.get('days')!=['31'] or q.get('selectAreaBcd')!=[code] or q.get('selectPpsClPpscd')!=[PURPOSE] for q in daily):
+                    errors.append('request condition mismatch')
+                if expected not in body or (not diagnostic and '土日曜' not in body) or '1か月表示' not in body or target_label not in body or 'バレーボール' not in body:
+                    errors.append('server search condition echo not verified')
+                empty_text='指定条件に該当する空き施設が見つかりませんでした' in body
+                if (not rows)!=empty_text: errors.append('API / page empty indication mismatch')
+                report={'地区':district,'開始日':start.isoformat(),'終了日':end.isoformat(),'空き枠':slots,'注意':errors,'通信':calls,'送信条件':requests,'ページ':pages,'API件数':len(rows),'API抜粋':[public_row(r) for r in rows[:3]],'網羅性':'要検証' if errors else 'API件数一致','対照検索':control,'陽性診断':diagnostic,'時間帯方式':time_mode}
+                (OUT/f'{code}-{start}-{time_mode}{"-positive" if diagnostic else ""}.json').write_text(json.dumps({**report,'API全公開項目':[public_row(r) for r in rows]},ensure_ascii=False,indent=2),encoding='utf-8')
+                print('DISTRICT_RESULT',json.dumps(report,ensure_ascii=False),flush=True)
+                return report
+            finally:
+                page.remove_listener('request',observe_request)
+                page.remove_listener('response',observe)
+                page.close()
+
+
+        month=candidate_month()
+        reports=[]
+        with sync_playwright() as p:
+            chrome=os.environ.get('SHINAGAWA_CHROME')
+            browser=p.chromium.launch(**({'executable_path':chrome} if chrome else {}),timeout=15000)
+            try:
+                for district,code in DISTRICTS.items():
+                    for mode in ('parts','allday'):
+                        try: reports.append(scan(browser,district,code,month,time_mode=mode))
+                        except Exception as e:
+                            reports.append({'地区':district,'時間帯方式':mode,'エラー':str(e)[:400],'空き枠':[]})
+                        time.sleep(1)
+            finally: browser.close()
+        failed=[r for r in reports if r.get('エラー') or r.get('注意')]
+        slots={tuple(s[k] for k in ('地区','館','施設','日付','開始','終了')):s for r in reports for s in r['空き枠']}
+        # Combine only exactly adjacent time slots within one facility/date.
+        def rank_candidates(slots):
+            groups={}
+            for s in slots:
+                k=tuple(s[x] for x in ('地区','館','施設','日付'))
+                groups.setdefault(k,[]).append((minutes(s['開始']),minutes(s['終了'])))
+            result=[]
+            for k,ranges in groups.items():
+                merged=[]
+                for x,y in sorted(set(ranges)):
+                    if merged and x==merged[-1][1]: merged[-1]=(merged[-1][0],y)
+                    elif merged and x<merged[-1][1]:
+                        # Overlapping but non-identical records need inspection, not inflated durations.
+                        raise ValueError('overlapping candidate intervals: '+str(k))
+                    else: merged.append((x,y))
+                for x,y in merged:
+                    result.append(dict(zip(('地区','館','施設','日付'),k),開始=f'{x//60:02}:{x%60:02}',終了=f'{y//60:02}:{y%60:02}',分=y-x,優先度='S' if y-x>=240 else 'A' if y-x>=180 else 'B' if y-x>=120 else 'C'))
+            return sorted(result,key=lambda s:(-s['分'],s['日付'],s['開始'],s['館'],s['施設']))
+        ranked=rank_candidates(slots.values()) if not failed else []
+        result={'対象月':month.strftime('%Y-%m'),'検索予定':10,'検索成功':len(reports)-len(failed),'候補数':len(ranked),'候補':ranked,'失敗':failed,'注意':'公開API上の候補。予約開始後の空き・利用資格は未保証。'}
+        (OUT/'monthly-candidates.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+        print('MONTHLY_CANDIDATE_SUMMARY',json.dumps({k:v for k,v in result.items() if k!='候補'},ensure_ascii=False),flush=True)
+        with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+            f.write(f"## {result['対象月']} 学校予約候補\n{result['候補数']}候補 / {result['検索成功']}/10検索成功\n公開API候補・予約可否未確定\n")
+            for s in ranked: f.write(f"- [{s['優先度']}] {s['日付']} {s['開始']}–{s['終了']} {s['館']} {s['施設']}\n")
+        if failed or len(reports)!=10: raise SystemExit('Candidate search incomplete: no LINE notification')
+        PY
+    - name: 月次候補LINE通知
+      if: success() && (github.event_name == 'schedule' || inputs.mode == 'candidate_notify')
+      env:
+        LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+        LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import json, os, uuid
+        from pathlib import Path
+        from urllib.request import Request,urlopen
+        from urllib.error import HTTPError
+
+        def push(message,retry_key=None):
+            token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'); recipient=os.environ.get('LINE_USER_ID')
+            if not token or not recipient: raise RuntimeError('LINE secrets missing')
+            headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}
+            if retry_key: headers['X-Line-Retry-Key']=retry_key
+            req=Request('https://api.line.me/v2/bot/message/push',data=json.dumps({'to':recipient,'messages':[{'type':'text','text':message}]},ensure_ascii=False).encode(),headers=headers,method='POST')
+            try:
+                with urlopen(req,timeout=20) as res:
+                    if res.status!=200: raise RuntimeError('LINE push failure')
+            except HTTPError as e:
+                if retry_key and e.code==409 and e.headers.get('X-Line-Accepted-Request-Id'): return
+                raise RuntimeError('LINE HTTP '+str(e.code)) from None
+
+        data=json.loads(Path('shinagawa-results/monthly-candidates.json').read_text())
+        if data['失敗'] or data['検索成功']!=data['検索予定']: raise RuntimeError('incomplete candidate search')
+        rows=data['候補']
+        link=os.environ['GITHUB_SERVER_URL']+'/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID']
+        lines=[f"🏐 品川区 {data['対象月']} 学校予約候補：{len(rows)}件",'公開API候補・予約可否未確定。20日9時の受付開始後に要確認。']
+        footer='\n全候補・実行結果：'+link
+        for r in rows:
+            label=f"[{r['優先度']}] {r['日付'][5:]} {r['開始']}〜{r['終了']} {r['館']} {r['施設']}"
+            if len(('\n'.join(lines+[label])+footer).encode('utf-16-le'))//2>4200:
+                lines.append('以下省略'); break
+            lines.append(label)
+        retry=str(uuid.uuid5(uuid.NAMESPACE_URL,'shinagawa-monthly:'+os.environ['GITHUB_RUN_ID']))
+        push('\n'.join(lines)+footer,retry)
+        print('MONTHLY_LINE_OK',len(rows))
+        PY
+    - name: 全候補を保存
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: shinagawa-monthly-candidates
+        path: shinagawa-results/
+        if-no-files-found: warn
+        retention-days: 7

@@ -342,11 +342,15 @@ jobs:
             for district,code in DISTRICTS.items():
                 files=[OUT/f'{code}-{start}-{mode}.json' for mode in ('parts','allday')]
                 if not all(f.exists() for f in files): continue
-                sets=[{row_key(r) for r in json.loads(f.read_text())['API全公開項目']} for f in files]
+                sets=[{json.dumps(r,ensure_ascii=False,sort_keys=True) for r in json.loads(f.read_text())['API全公開項目']} for f in files]
                 audit_comparison.append({'地区':district,'開始日':str(start),'午前午後夜間':len(sets[0]),'終日':len(sets[1]),'差分':len(sets[0]^sets[1])})
         print('MODE_COMPARISON',json.dumps(audit_comparison,ensure_ascii=False),flush=True)
+        positive_files=[OUT/f'1100_0-{TODAY}-{mode}-positive.json' for mode in ('parts','allday')]
+        positive_sets=[{json.dumps(r,ensure_ascii=False,sort_keys=True) for r in json.loads(f.read_text())['API全公開項目']} for f in positive_files] if all(f.exists() for f in positive_files) else []
+        positive_difference=len(positive_sets[0]^positive_sets[1]) if len(positive_sets)==2 else None
+        print('POSITIVE_DIFFERENCE',positive_difference,flush=True)
         # Keep the two modes in regular monitoring until their semantics are established.
-        result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS)*2,'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'検索結果':reports,'診断':diagnostics,'時間帯比較':audit_comparison,'失敗検索数':len(failed),'網羅性':'検証中'}
+        result={'検索日':TODAY.isoformat(),'対象終了日':horizon.isoformat(),'検索予定':len(starts)*len(DISTRICTS)*2,'取得枠':sorted(slots.values(),key=lambda s:(s['日付'],s['開始'],s['館'])),'検索結果':reports,'診断':diagnostics,'時間帯比較':audit_comparison,'陽性比較差分':positive_difference,'失敗検索数':len(failed),'網羅性':'検証中'}
         result['学校枠']=[s for s in result['取得枠'] if s['種別']=='学校']
         result['学校以外枠']=[s for s in result['取得枠'] if s['種別']!='学校']
         (OUT/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -354,7 +358,7 @@ jobs:
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
             f.write(f"## 品川区 API検証\n取得 {len(slots)}枠 / 検索 {len(reports)}回 / 失敗 {len(failed)}回\n")
             for s in result['取得枠']: f.write(f"- {s['日付']} {s['開始']}–{s['終了']} {s['館']} {s['施設']} {s['予約状態']}\n")
-        if failed or any(r.get('エラー') or r.get('注意') for r in diagnostics.values()): raise SystemExit('Partial or ambiguous results: inspect report')
+        if failed or len(audit_comparison)!=len(starts)*len(DISTRICTS) or any(r['差分'] for r in audit_comparison) or positive_difference!=0 or any(r.get('エラー') or r.get('注意') for r in diagnostics.values()): raise SystemExit('Partial results or time-mode differences: inspect report')
         PY
     - name: 結果を保存
       if: always()
