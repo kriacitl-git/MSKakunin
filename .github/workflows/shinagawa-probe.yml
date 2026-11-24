@@ -9,7 +9,7 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -34,15 +34,15 @@ jobs:
             echo "No system browser; installing headless shell only"
             python -m playwright install --only-shell chromium
           fi
-      - name: 公開検索結果の診断（荏原地区のみ・予約なし）
-        timeout-minutes: 2
+      - name: 公開検索結果の診断（日付順・荏原地区・予約なし）
+        timeout-minutes: 3
         shell: bash
         run: |
-          timeout --signal=TERM --kill-after=5s 100s python -u - <<'PY'
+          timeout --signal=TERM --kill-after=5s 150s python -u - <<'PY'
           import json
           import os
           from pathlib import Path
-          from urllib.parse import urlsplit
+          from urllib.parse import urlsplit, parse_qsl
           from playwright.sync_api import sync_playwright
 
           URL = 'https://www.cm9.eprs.jp/shinagawa/web/index.jsp'
@@ -57,7 +57,7 @@ jobs:
               selects: [...document.querySelectorAll('select')].map(e=>({id:e.id,name:e.name,visible:visible(e),selected:e.selectedOptions[0]?.textContent,options:[...e.options].map(o=>({text:clean(o.textContent),value:o.value}))})),
               inputs: [...document.querySelectorAll('input:not([type=hidden])')].map(e=>({id:e.id,name:e.name,type:e.type,visible:visible(e),checked:e.checked,labels:[...(e.labels||[])].map(l=>clean(l.textContent))})),
               controls: [...document.querySelectorAll('a,button,[role=button],input[type=button],input[type=submit]')].filter(visible).slice(0,100).map(e=>({tag:e.tagName,id:e.id,text:clean(e.innerText||e.value||e.getAttribute('aria-label')),title:clean(e.title)})),
-              tables: [...document.querySelectorAll('table')].filter(visible).slice(0,16).map(t=>({id:t.id,classes:t.className,row_count:t.rows.length,rows:[...t.rows].slice(0,12).map(r=>[...r.cells].slice(0,45).map(c=>({tag:c.tagName,text:clean(c.innerText,120),title:clean(c.title),classes:c.className,rowspan:c.rowSpan,colspan:c.colSpan,images:[...c.querySelectorAll('img')].slice(0,4).map(i=>({alt:clean(i.alt),title:clean(i.title),src:new URL(i.src,location.href).pathname.split('/').pop()})),labels:[...c.querySelectorAll('[aria-label]')].slice(0,4).map(e=>clean(e.getAttribute('aria-label')))})))}))
+              tables: [...document.querySelectorAll('table')].filter(visible).slice(0,30).map(t=>({id:t.id,classes:t.className,row_count:t.rows.length,rows:[...t.rows].slice(0,100).map(r=>[...r.cells].slice(0,45).map(c=>({tag:c.tagName,text:clean(c.innerText,120),title:clean(c.title),classes:c.className,rowspan:c.rowSpan,colspan:c.colSpan,images:[...c.querySelectorAll('img')].slice(0,4).map(i=>({alt:clean(i.alt),title:clean(i.title),src:new URL(i.src,location.href).pathname.split('/').pop()})),labels:[...c.querySelectorAll('[aria-label]')].slice(0,4).map(e=>clean(e.getAttribute('aria-label')))})))}))
             };
           }'''
           def snapshot(page, label):
@@ -75,6 +75,12 @@ jobs:
               print('SHINAGAWA_RESULT_BEGIN',label,flush=True)
               print(json.dumps(compact,ensure_ascii=False),flush=True)
               print('SHINAGAWA_RESULT_END',label,flush=True)
+              for f in report:
+                  summary = {'stage':label,'selects':f.get('selects',[]),'tables':[]}
+                  for t in f.get('tables',[]):
+                      summary['tables'].append({'id':t['id'],'rows':t['row_count'],
+                          'sample':[[{'text':c['text'],'title':c['title'],'alt':[i['alt'] for i in c['images']]} for c in row] for row in t['rows'][:6]]})
+                  print('TABLE_SUMMARY',json.dumps(summary,ensure_ascii=False),flush=True)
               try:
                   page.screenshot(path=str(out/(label+'.png')),full_page=True,timeout=10000)
               except Exception as e:
@@ -87,7 +93,7 @@ jobs:
               responses=[]
               def observe(r):
                   if r.request.resource_type in ('document','xhr','fetch') and urlsplit(r.url).hostname == urlsplit(URL).hostname and len(responses)<80:
-                      responses.append({'method':r.request.method,'path':urlsplit(r.url).path,'status':r.status})
+                      responses.append({'method':r.request.method,'path':urlsplit(r.url).path,'status':r.status,'form_keys':sorted({k for k,v in parse_qsl(r.request.post_data or '',keep_blank_values=True)}) if r.request.method=='POST' and 'application/x-www-form-urlencoded' in r.request.headers.get('content-type','') else []})
               page.on('response',observe)
               page.set_default_timeout(8000)
               try:
@@ -166,6 +172,22 @@ jobs:
                   page.wait_for_timeout(1000)
                   snapshot(page,'after-search')
                   print('PUBLIC_SEARCH_CLICKED',flush=True)
+                  # The previous run confirmed this is a public result navigation tab.
+                  # Test the date-oriented view first to avoid a request per room.
+                  date_tab = page.get_by_role('link',name='日付順',exact=True)
+                  if date_tab.count()!=1 or not date_tab.is_visible():
+                      raise RuntimeError('date-order tab unavailable')
+                  print('OPEN_DATE_ORDER',flush=True)
+                  ready()
+                  date_tab.click(timeout=10000)
+                  try:
+                      page.wait_for_load_state('networkidle',timeout=12000)
+                  except Exception:
+                      pass
+                  ready()
+                  page.wait_for_timeout(1200)
+                  snapshot(page,'date-order')
+                  print('DATE_ORDER_INSPECTED',flush=True)
                   if not any(r['method']=='POST' and r['status']<400 for r in responses) and not any(r['path'] != '/shinagawa/web/index.jsp' and r['status']<400 for r in responses):
                       print('WARNING: search response not independently confirmed',flush=True)
               except Exception as e:
